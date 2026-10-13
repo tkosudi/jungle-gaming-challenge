@@ -1,0 +1,31 @@
+# Version control
+.git
+.github
+
+# IDE and development agents
+.cursor
+.claude
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Build outputs
+bin/
+dist/
+tmp/
+*.exe
+*.test
+
+# Test artifacts
+coverage.out
+coverage.html
+*.prof
+
+# Local files
+*.log
+.DS_Store
+
+# Documentation not required by the Go build
+docs/

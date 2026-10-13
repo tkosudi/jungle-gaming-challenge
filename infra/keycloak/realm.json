@@ -1,0 +1,82 @@
+{
+    "realm": "jungle",
+    "enabled": true,
+    "displayName": "Jungle Gaming - Local",
+    "sslRequired": "none",
+    "accessTokenLifespan": 300,
+    "clients": [
+      {
+        "clientId": "provider-a",
+        "name": "Provider A",
+        "enabled": true,
+        "protocol": "openid-connect",
+        "publicClient": false,
+        "clientAuthenticatorType": "client-secret",
+        "secret": "provider-a-local-secret",
+        "standardFlowEnabled": false,
+        "directAccessGrantsEnabled": false,
+        "serviceAccountsEnabled": true,
+        "protocolMappers": [
+          {
+            "name": "wagering-api-audience",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {
+              "included.custom.audience": "wagering-api",
+              "access.token.claim": "true",
+              "id.token.claim": "false"
+            }
+          }
+        ]
+      },
+      {
+        "clientId": "provider-b",
+        "name": "Provider B",
+        "enabled": true,
+        "protocol": "openid-connect",
+        "publicClient": false,
+        "clientAuthenticatorType": "client-secret",
+        "secret": "provider-b-local-secret",
+        "standardFlowEnabled": false,
+        "directAccessGrantsEnabled": false,
+        "serviceAccountsEnabled": true,
+        "protocolMappers": [
+          {
+            "name": "wagering-api-audience",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {
+              "included.custom.audience": "wagering-api",
+              "access.token.claim": "true",
+              "id.token.claim": "false"
+            }
+          }
+        ]
+      },
+      {
+        "clientId": "internal-service",
+        "name": "Internal Wallet Service",
+        "enabled": true,
+        "protocol": "openid-connect",
+        "publicClient": false,
+        "clientAuthenticatorType": "client-secret",
+        "secret": "internal-local-secret",
+        "standardFlowEnabled": false,
+        "directAccessGrantsEnabled": false,
+        "serviceAccountsEnabled": true,
+        "protocolMappers": [
+          {
+            "name": "wagering-api-audience",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {
+              "included.custom.audience": "wagering-api",
+              "access.token.claim": "true",
+              "id.token.claim": "false"
+            }
+          }
+        ]
+      }
+    ]
+  }
+  
