@@ -1,0 +1,28 @@
+# Segredos e configuracoes locais (preservar exemplos versionados)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Artefatos Go, builds e cobertura
+/bin/
+/dist/
+/coverage/
+coverage.out
+coverage.html
+*.test
+*.prof
+*.out
+
+# Cursor: ignorar apenas artefatos locais, nao regras compartilhadas
+.cursor/worktrees/
+.cursor/cache/
+.cursor/*.local.json
+# Manter .cursor/rules/ e .cursor/skills/ versionaveis quando criados.
+
+# Sistema operacional e arquivos temporarios
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
