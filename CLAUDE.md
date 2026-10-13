@@ -92,3 +92,32 @@ Inclua um pequeno exemplo de entrada/saída ou uma sequência de passos quando m
 - Se um comando não puder ser executado, diga claramente qual, por quê e como reproduzi-lo; jamais declare sucesso presumido.
 - Reporte requisitos não atendidos, decisões pendentes e riscos.
 - **Pare ao finalizar a tarefa solicitada. Não inicie a próxima automaticamente.**
+
+## 8. Estilo obrigatório: Go idiomático, legível e simples
+
+**Prioridade:** correção financeira e segurança > clareza do fluxo > simplicidade > extensibilidade comprovadamente necessária. Código curto não é necessariamente código simples. Preserve todas as garantias de produção.
+
+- Escreva Go que um engenheiro Go consiga acompanhar de cima para baixo, sem conhecer padrões ou bibliotecas além das efetivamente usadas. Prefira nomes específicos, funções diretas, retornos antecipados de erro e tratamento explícito de recursos.
+- Comece pela implementação **mais simples que satisfaz os requisitos e os testes**. Para introduzir interface, factory, wrapper, helper, struct, goroutine, canal, pacote ou camada, explique qual problema real ela resolve **agora**. Se não houver justificativa concreta, não introduza.
+- Siga a convenção de Go: interfaces pequenas, preferencialmente definidas por quem as consome; composição em vez de hierarquias; `context.Context` quando a operação suporta cancelamento; erros com contexto (`fmt.Errorf(... %w ...)`) quando útil. Evite abstrações e padrões de Java/C# transplantados para Go.
+- Prefira construtores previsíveis (`NewServer`, `NewStore`, `NewService`) que revelem dependências e retornem uma estrutura utilizável. Centralize registro de rotas no transporte e mantenha handlers finos, sem SQL ou regras financeiras.
+- Mantenha **Uber Fx apenas na composição/inicialização e nos adaptadores de lifecycle**. Código de domínio e casos de uso não podem importar Fx/Fiber/pgx. Os detalhes de `OnStart`, `OnStop`, listener, goroutine, shutdown, timeout e cleanup devem continuar corretos e fáceis de rastrear.
+- Não use `fx.Invoke` vazio por hábito. Se uma construção precisa ser forçada para registrar hooks, explique isso, escolha a ligação mais explícita e preserve a ordem de startup/shutdown. Não substitua garantias reais por uma API mais bonita.
+- Configuração: carregamento simples, validação explícita de entradas obrigatórias e inválidas, defaults documentados e testes determinísticos. Não adicione Viper ou outro framework só para reduzir linhas. Uma pequena função de injeção de ambiente é permitida se facilitar concretamente os testes.
+- SQL permanece explícito e gerado via sqlc quando aplicável. **Nunca** simplifique removendo transações, constraints, locks, idempotência persistente, validação de overflow, rollback ou fechamento de recursos.
+- Prefira comentários que expliquem o **porquê**, invariantes ou armadilhas, não comentários que repitam o código. Evite siglas crípticas, funções triviais desnecessariamente fragmentadas e testes com mocks que escondam garantias exigidas do PostgreSQL/SQS/IdP.
+- Não faça grandes refatorações enquanto implementa novos comportamentos. Escolha mudanças pequenas e verificáveis. Sem necessidade concreta, mantenha os arquivos simples já existentes como estão.
+
+### Revisão de legibilidade antes de declarar pronto
+
+Confira e responda objetivamente:
+
+1. Um leitor consegue identificar em até alguns minutos onde a requisição entra, onde fica a regra de negócio e onde ocorre a persistência?
+2. Cada abstração nova existe para resolver uma necessidade atual? Qual? Uma função direta seria mais clara?
+3. O fluxo de erros e cancelamentos é óbvio? Toda aquisição de recurso tem cleanup nas rotas de sucesso **e** falha?
+4. Há complexidade acidental que pode ser removida **sem perder** concorrência correta, idempotência, atomicidade, segurança ou testes?
+5. Você consegue explicar a solução em português, com um exemplo concreto, sem recorrer a jargões como "SOLID" ou "clean architecture" como justificativa suficiente?
+
+**Para funcionalidades novas:** mantenha RED → GREEN → REFACTOR com evidências reais. **Para refatoração pura:** execute a suíte existente antes e depois, prove que o comportamento foi preservado e não invente uma etapa RED artificial. Se alterar contratos, erros, rotas ou semântica, trate como mudança funcional e exija testes apropriados.
+
+No relatório final, separe: (a) complexidade essencial imposta pelos requisitos; (b) complexidade evitada/removida; (c) trade-offs e garantias preservadas. Se a opção mais curta piorar a segurança ou a clareza, mantenha a opção mais explícita.
