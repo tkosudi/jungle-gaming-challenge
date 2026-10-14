@@ -7,9 +7,10 @@ Registro das decisões aprovadas, com o status real de implementação. O enunci
 | Área | Situação |
 | --- | --- |
 | Schema financeiro PostgreSQL (M1.1) | Implementado e coberto por testes de integração reais |
-| Tipo `Money`, agregados, repositórios, casos de uso | Pendente |
+| `Money`, `Wallet`, abertura de carteira e `BET` com idempotência (M1.2) | Implementado e testado; sem exposição HTTP |
 | Idempotência HTTP/SQS, locking por carteira no caso de uso | Pendente (o schema já sustenta as garantias de unicidade) |
-| Inbox, outbox, worker de referências | Pendente (D7) |
+| Outbox (persistência) | Implementado (M1.2); sem publicador |
+| Inbox, worker de referências, publicador SQS | Pendente |
 | Autenticação/autorização, SQS, observabilidade | Pendente |
 
 ## Migrations: golang-migrate (e não Atlas)
@@ -100,4 +101,41 @@ A garantia principal será `SELECT ... FOR UPDATE` na carteira, dentro da transa
 - A verificação do encadeamento lê o lançamento anterior no commit; em escritas concorrentes sem lock, `UNIQUE (wallet_id, wallet_version)` e o guard de versão derrubam uma delas, mas a serialização correta continua dependendo de `SELECT ... FOR UPDATE`.
 - Os triggers de ledger são `AFTER INSERT`; a imutabilidade do ledger e das transações terminais impede que um histórico confirmado deixe de bater, exceto por papel dono/superusuário (D8).
 - Códigos de falha (`failure_code`) são texto livre não vazio; o catálogo estável será definido com os casos de uso.
-- Inbox e outbox não existem ainda; a outbox é pré-requisito das operações que emitem eventos (D7).
+- A inbox não existe ainda; a outbox existe a partir do M1.2 (D7).
+
+## Núcleo financeiro (M1.2): decisões
+
+Implementado: `Money`, abertura de carteira, `BET` síncrona, idempotência persistente e outbox (somente persistência). Não implementado: WIN, LOSS, REFUND, ROLLBACK, HTTP, autenticação, SQS, workers.
+
+### Organização
+- `internal/domain`: `Money`, `Bet` (validação e hash canônico), `Wallet.Debit`. Sem pgx/Fx.
+- `internal/usecase`: `Service.OpenWallet` e `Service.PlaceBet`, dono dos limites transacionais. Depende de `Store`/`Tx`, interfaces definidas por quem as consome: a regra do projeto proíbe pgx nos casos de uso, e a implementação vive em `internal/postgres`.
+- `internal/postgres`: `Store` (transação `READ COMMITTED`) e `db/sqlc` (código gerado de `db/queries`; regenerar com `docker run --rm -v "$PWD:/src" -w /src sqlc/sqlc:1.30.0 generate`).
+
+### Money
+`int64` em centavos, escala fixa de duas casas, sem sinal, espaço, zeros à esquerda ou notação científica; overflow detectado no parsing e na soma. Moedas: subconjunto ISO 4217 ativo com duas casas decimais (lista fixa em `money.go`); JPY, KWD e códigos de teste ficam de fora por não caberem na escala do contrato.
+
+### Identidade do provedor
+`PlaceBet(ctx, providerID, bet)` recebe o provedor como argumento separado dos dados da BET. Quem chamar (HTTP/SQS) deve derivá-lo da identidade autenticada. Hoje nada impede um chamador interno de passar um valor arbitrário; a derivação autenticada é pendente do milestone de autenticação.
+
+### Idempotência
+- Hash canônico v1 (`Bet.PayloadHash`): SHA-256 de campos com prefixo de tamanho, em ordem fixa (provedor, ID externo, jogador, carteira, rodada, jogo, tipo, valor `d.dd`, moeda); UUIDs normalizados; chave de idempotência fora do hash.
+- Replay: existe operação do provedor com a mesma chave **e** o mesmo hash. Qualquer outra colisão (mesma chave com outro conteúdo, mesmo ID externo com outra chave) é `ErrIdempotencyConflict`.
+- O `INSERT` usa `ON CONFLICT DO NOTHING`: quem perde a corrida espera o commit do vencedor, não escreve nada e relê o resultado dele. Não há retry nem violação UNIQUE tratada como replay. Vale também para duplicatas em carteiras diferentes (a UNIQUE é por provedor, não por carteira).
+- O replay devolve status, `failure_code` e `result_balance` persistidos, não o saldo atual.
+
+### BET
+Ordem: consulta de replay sem lock → `SELECT ... FOR UPDATE` da carteira → decisão → `INSERT` da transação → saldo/versão → ledger → outbox, num único commit. Saldo insuficiente, carteira inexistente ou de outro jogador (`WALLET_NOT_FOUND`) e moeda divergente (`CURRENCY_MISMATCH`) são `REJECTED` persistidos (D3), sem ledger e sem alterar a carteira. Rejeições sem carteira válida usam `wallet_id` nulo e `result_balance` nulo.
+
+### Falhas e commit incerto
+- `lock_timeout` por transação (parâmetro do `Store`); estouro vira `ErrLockTimeout`, sem efeito persistido, reenvio seguro.
+- Erro devolvido pelo servidor no COMMIT (incluindo triggers diferidos) é falha definitiva da transação.
+- Falha de conexão ou contexto durante o COMMIT vira `ErrCommitUnknown`. O chamador reenvia a mesma requisição com a mesma chave: se o commit ocorreu, recebe o replay do resultado original; se não, a operação é aplicada uma única vez. Não há retry automático no serviço.
+
+### Outbox (migration 000002)
+`outbox_events`: `event_id` (também MessageDeduplicationId), `message_group_id` (carteira, MessageGroupId), `payload` (envelope completo, snapshot imutável por trigger), `sequence` (ordem por carteira, atribuída sob o lock), estado de publicação (`attempts`, `next_attempt_at`, `published_at`) e `UNIQUE (transaction_id, event_type)`. Eventos gravados: `WagerTransactionProcessed` + `WalletBalanceChanged` (BET processada e abertura positiva) e `WagerTransactionRejected`. Sem publicador; `correlationId` é o ID da transação financeira.
+
+### Limites do M1.2
+- Os testes de concorrência usam goroutines com pools e conexões independentes no mesmo processo, **não** três processos. O teste com três processos reais continua pendente.
+- O publicador da outbox, retries de entrega e DLQ não existem; as linhas apenas acumulam.
+- `Service` ainda não é composto no Fx e não há endpoint: só os testes o exercitam.

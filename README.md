@@ -2,7 +2,7 @@
 
 Implementação do desafio técnico de processamento financeiro distribuído de apostas com API HTTP e mensagens SQS.
 
-> **Status:** M0.1 (bootstrap Fx + Fiber + PostgreSQL) e M1.1 (schema financeiro PostgreSQL) implementados e testados; domínio, casos de uso, autenticação, SQS e outbox ainda não existem. Detalhes em [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> **Status:** M0.1 (bootstrap), M1.1 (schema financeiro) e M1.2 (Money, carteira, BET, idempotência e outbox; sem HTTP) implementados e testados; WIN/LOSS/REFUND/ROLLBACK, autenticação, SQS e publicador da outbox ainda não existem. Detalhes em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Documentos
 
@@ -78,12 +78,12 @@ Ainda pendentes e não documentados como executáveis: testes com autenticação
 | Área | Situação |
 | --- | --- |
 | Composição Fx + HTTP (`GET /health/live`) + pool PostgreSQL, com início e encerramento | Implementado e testado (M0.1) |
-| Domínio Money, Wallet, Transaction, Ledger | Pendente |
+| Domínio `Money`, `Wallet`, `Bet`; abertura de carteira e BET com idempotência (sem HTTP) | Implementado e testado (M1.2) |
 | Schema financeiro PostgreSQL (migrations, constraints, triggers) | Implementado e testado (M1.1) |
-| Repositórios, idempotência e concorrência no caso de uso | Pendente |
+| WIN, LOSS, REFUND, ROLLBACK | Pendente |
 | Autenticação/autorização com IdP real | Pendente |
 | Consumer SQS, inbox e DLQ | Pendente |
-| Outbox e eventos | Pendente |
+| Outbox: persistência | Implementado (M1.2); publicador pendente |
 | Referências pendentes, reversões e reconciliação | Pendente |
 | Testes distribuídos e recuperação | Pendente |
 
