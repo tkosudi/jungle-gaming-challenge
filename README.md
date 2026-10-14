@@ -2,7 +2,7 @@
 
 Implementação do desafio técnico de processamento financeiro distribuído de apostas com API HTTP e mensagens SQS.
 
-> **Status:** M0.1 (bootstrap), M1.1 (schema financeiro) e M1.2 (Money, carteira, BET, idempotência e outbox; sem HTTP) implementados e testados; WIN/LOSS/REFUND/ROLLBACK, autenticação, SQS e publicador da outbox ainda não existem. Detalhes em [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> **Status:** M0.1 (bootstrap), M1.1 (schema financeiro), M1.2 (Money, carteira, BET, idempotência e outbox) e M1.3 (WIN, LOSS, REFUND, ROLLBACK e referências pendentes, sem HTTP) implementados e testados; autenticação, SQS, laço automático do worker e publicador da outbox ainda não existem. Detalhes em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Documentos
 
@@ -16,7 +16,7 @@ Go 1.26+, Uber Fx, Fiber v3, PostgreSQL, pgx/v5, sqlc, golang-migrate v4.20.1 (b
 
 ## Como executar
 
-Disponível hoje: a API com um único endpoint, `GET /health/live`, conectada ao PostgreSQL, e as migrations do schema financeiro. Não existem ainda endpoints financeiros, autenticação, consumidor SQS nem outbox (ver "Estado da entrega").
+Disponível hoje: a API com um único endpoint, `GET /health/live`, conectada ao PostgreSQL, e as migrations do schema financeiro. Não existem ainda endpoints financeiros, autenticação, consumidor SQS nem publicador da outbox (ver "Estado da entrega").
 
 ### Pré-requisitos
 
@@ -78,13 +78,14 @@ Ainda pendentes e não documentados como executáveis: testes com autenticação
 | Área | Situação |
 | --- | --- |
 | Composição Fx + HTTP (`GET /health/live`) + pool PostgreSQL, com início e encerramento | Implementado e testado (M0.1) |
-| Domínio `Money`, `Wallet`, `Bet`; abertura de carteira e BET com idempotência (sem HTTP) | Implementado e testado (M1.2) |
+| Domínio `Money`, `Wallet`, `Operation`; abertura de carteira e BET com idempotência (sem HTTP) | Implementado e testado (M1.2) |
 | Schema financeiro PostgreSQL (migrations, constraints, triggers) | Implementado e testado (M1.1) |
-| WIN, LOSS, REFUND, ROLLBACK | Pendente |
+| WIN, LOSS, REFUND, ROLLBACK (sem HTTP) | Implementado e testado (M1.3) |
 | Autenticação/autorização com IdP real | Pendente |
 | Consumer SQS, inbox e DLQ | Pendente |
 | Outbox: persistência | Implementado (M1.2); publicador pendente |
-| Referências pendentes, reversões e reconciliação | Pendente |
+| Referências pendentes: persistência, replay e passo transacional do worker | Implementado e testado (M1.3); laço automático pendente |
+| Reconciliação | Pendente |
 | Testes distribuídos e recuperação | Pendente |
 
 ## Princípios de implementação

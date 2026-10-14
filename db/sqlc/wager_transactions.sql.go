@@ -12,6 +12,31 @@ import (
 	"github.com/google/uuid"
 )
 
+const claimDuePendingReference = `-- name: ClaimDuePendingReference :one
+SELECT t.id, t.wallet_id
+FROM wager_transactions t
+JOIN wallets w ON w.id = t.wallet_id
+WHERE t.status = 'PENDING_REFERENCE' AND t.next_attempt_at <= now()
+ORDER BY t.next_attempt_at, t.id
+LIMIT 1
+FOR UPDATE OF w SKIP LOCKED
+`
+
+type ClaimDuePendingReferenceRow struct {
+	ID       uuid.UUID
+	WalletID *uuid.UUID
+}
+
+// Trava a carteira da pendência, não a transação: a ordem de locks é sempre carteira ->
+// transação, e SKIP LOCKED evita esperar por uma carteira ocupada (e deadlock entre workers).
+// O snapshot deste statement pode estar velho depois do lock; quem chama relê a pendência.
+func (q *Queries) ClaimDuePendingReference(ctx context.Context) (ClaimDuePendingReferenceRow, error) {
+	row := q.db.QueryRow(ctx, claimDuePendingReference)
+	var i ClaimDuePendingReferenceRow
+	err := row.Scan(&i.ID, &i.WalletID)
+	return i, err
+}
+
 const findProviderOperations = `-- name: FindProviderOperations :many
 SELECT id, kind, status, idempotency_key, external_transaction_id, payload_hash,
        failure_code, result_balance, currency
@@ -69,57 +94,94 @@ func (q *Queries) FindProviderOperations(ctx context.Context, arg FindProviderOp
 	return items, nil
 }
 
-const insertBetTransaction = `-- name: InsertBetTransaction :one
-INSERT INTO wager_transactions (
-    id, kind, status, wallet_id, player_id, amount, currency,
-    provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id,
-    failure_code, result_balance, created_at, updated_at)
-VALUES ($1, 'BET', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
-ON CONFLICT DO NOTHING
-RETURNING id
+const findReferenceTransaction = `-- name: FindReferenceTransaction :one
+SELECT t.id, t.kind, t.status, t.player_id, t.wallet_id, t.round_id, t.amount, t.currency,
+       EXISTS (
+           SELECT 1 FROM wager_transactions c
+            WHERE c.reference_transaction_id = t.id
+              AND c.status = 'PROCESSED' AND c.kind IN ('REFUND', 'ROLLBACK')
+       ) AS compensated
+FROM wager_transactions t
+WHERE t.provider_id = $1 AND t.external_transaction_id = $2
 `
 
-type InsertBetTransactionParams struct {
-	ID                    uuid.UUID
-	Status                string
-	WalletID              *uuid.UUID
-	PlayerID              uuid.UUID
-	Amount                int64
-	Currency              string
+type FindReferenceTransactionParams struct {
 	ProviderID            *string
 	ExternalTransactionID *string
-	IdempotencyKey        *string
-	PayloadHash           []byte
-	RoundID               *string
-	GameID                *string
-	FailureCode           *string
-	ResultBalance         *int64
-	CreatedAt             time.Time
 }
 
-// ON CONFLICT sem alvo cobre as duas UNIQUEs de idempotência do provedor; quem perde a corrida
-// espera o commit do vencedor e recebe zero linhas, sem abortar a transação.
-func (q *Queries) InsertBetTransaction(ctx context.Context, arg InsertBetTransactionParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, insertBetTransaction,
-		arg.ID,
-		arg.Status,
-		arg.WalletID,
-		arg.PlayerID,
-		arg.Amount,
-		arg.Currency,
-		arg.ProviderID,
-		arg.ExternalTransactionID,
-		arg.IdempotencyKey,
-		arg.PayloadHash,
-		arg.RoundID,
-		arg.GameID,
-		arg.FailureCode,
-		arg.ResultBalance,
-		arg.CreatedAt,
+type FindReferenceTransactionRow struct {
+	ID          uuid.UUID
+	Kind        string
+	Status      string
+	PlayerID    uuid.UUID
+	WalletID    *uuid.UUID
+	RoundID     *string
+	Amount      int64
+	Currency    string
+	Compensated bool
+}
+
+// compensated: já existe REFUND ou ROLLBACK processado sobre a transação (DEC-001).
+func (q *Queries) FindReferenceTransaction(ctx context.Context, arg FindReferenceTransactionParams) (FindReferenceTransactionRow, error) {
+	row := q.db.QueryRow(ctx, findReferenceTransaction, arg.ProviderID, arg.ExternalTransactionID)
+	var i FindReferenceTransactionRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Status,
+		&i.PlayerID,
+		&i.WalletID,
+		&i.RoundID,
+		&i.Amount,
+		&i.Currency,
+		&i.Compensated,
 	)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
+	return i, err
+}
+
+const getDuePendingReference = `-- name: GetDuePendingReference :one
+SELECT id, wallet_id, player_id, kind, amount, currency, provider_id, external_transaction_id,
+       idempotency_key, round_id, game_id, reference_external_transaction_id, reference_attempts
+FROM wager_transactions
+WHERE id = $1 AND status = 'PENDING_REFERENCE' AND next_attempt_at <= now()
+`
+
+type GetDuePendingReferenceRow struct {
+	ID                             uuid.UUID
+	WalletID                       *uuid.UUID
+	PlayerID                       uuid.UUID
+	Kind                           string
+	Amount                         int64
+	Currency                       string
+	ProviderID                     *string
+	ExternalTransactionID          *string
+	IdempotencyKey                 *string
+	RoundID                        *string
+	GameID                         *string
+	ReferenceExternalTransactionID *string
+	ReferenceAttempts              int32
+}
+
+func (q *Queries) GetDuePendingReference(ctx context.Context, id uuid.UUID) (GetDuePendingReferenceRow, error) {
+	row := q.db.QueryRow(ctx, getDuePendingReference, id)
+	var i GetDuePendingReferenceRow
+	err := row.Scan(
+		&i.ID,
+		&i.WalletID,
+		&i.PlayerID,
+		&i.Kind,
+		&i.Amount,
+		&i.Currency,
+		&i.ProviderID,
+		&i.ExternalTransactionID,
+		&i.IdempotencyKey,
+		&i.RoundID,
+		&i.GameID,
+		&i.ReferenceExternalTransactionID,
+		&i.ReferenceAttempts,
+	)
+	return i, err
 }
 
 const insertOpeningTransaction = `-- name: InsertOpeningTransaction :exec
@@ -147,4 +209,126 @@ func (q *Queries) InsertOpeningTransaction(ctx context.Context, arg InsertOpenin
 		arg.CreatedAt,
 	)
 	return err
+}
+
+const insertOperation = `-- name: InsertOperation :one
+INSERT INTO wager_transactions (
+    id, kind, status, wallet_id, player_id, amount, currency,
+    provider_id, external_transaction_id, idempotency_key, payload_hash, round_id, game_id,
+    reference_external_transaction_id, reference_transaction_id,
+    failure_code, result_balance, next_attempt_at, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+        CASE WHEN $3::text = 'PENDING_REFERENCE' THEN now() + ($18::bigint * interval '1 millisecond') END,
+        $19, $19)
+ON CONFLICT DO NOTHING
+RETURNING id
+`
+
+type InsertOperationParams struct {
+	ID                             uuid.UUID
+	Kind                           string
+	Status                         string
+	WalletID                       *uuid.UUID
+	PlayerID                       uuid.UUID
+	Amount                         int64
+	Currency                       string
+	ProviderID                     *string
+	ExternalTransactionID          *string
+	IdempotencyKey                 *string
+	PayloadHash                    []byte
+	RoundID                        *string
+	GameID                         *string
+	ReferenceExternalTransactionID *string
+	ReferenceTransactionID         *uuid.UUID
+	FailureCode                    *string
+	ResultBalance                  *int64
+	Column18                       int64
+	CreatedAt                      time.Time
+}
+
+// ON CONFLICT sem alvo cobre as duas UNIQUEs de idempotência do provedor; quem perde a corrida
+// espera o commit do vencedor e recebe zero linhas, sem abortar a transação. A primeira
+// tentativa de uma pendência é agendada pelo relógio do banco ($18 em milissegundos).
+func (q *Queries) InsertOperation(ctx context.Context, arg InsertOperationParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertOperation,
+		arg.ID,
+		arg.Kind,
+		arg.Status,
+		arg.WalletID,
+		arg.PlayerID,
+		arg.Amount,
+		arg.Currency,
+		arg.ProviderID,
+		arg.ExternalTransactionID,
+		arg.IdempotencyKey,
+		arg.PayloadHash,
+		arg.RoundID,
+		arg.GameID,
+		arg.ReferenceExternalTransactionID,
+		arg.ReferenceTransactionID,
+		arg.FailureCode,
+		arg.ResultBalance,
+		arg.Column18,
+		arg.CreatedAt,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const reschedulePendingReference = `-- name: ReschedulePendingReference :execrows
+UPDATE wager_transactions
+SET reference_attempts = $2, next_attempt_at = now() + ($3::bigint * interval '1 millisecond'), updated_at = $4
+WHERE id = $1 AND status = 'PENDING_REFERENCE'
+`
+
+type ReschedulePendingReferenceParams struct {
+	ID                uuid.UUID
+	ReferenceAttempts int32
+	Column3           int64
+	UpdatedAt         time.Time
+}
+
+func (q *Queries) ReschedulePendingReference(ctx context.Context, arg ReschedulePendingReferenceParams) (int64, error) {
+	result, err := q.db.Exec(ctx, reschedulePendingReference,
+		arg.ID,
+		arg.ReferenceAttempts,
+		arg.Column3,
+		arg.UpdatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resolvePendingReference = `-- name: ResolvePendingReference :execrows
+UPDATE wager_transactions
+SET status = $2, failure_code = $3, result_balance = $4, reference_transaction_id = $5,
+    next_attempt_at = NULL, updated_at = $6
+WHERE id = $1 AND status = 'PENDING_REFERENCE'
+`
+
+type ResolvePendingReferenceParams struct {
+	ID                     uuid.UUID
+	Status                 string
+	FailureCode            *string
+	ResultBalance          *int64
+	ReferenceTransactionID *uuid.UUID
+	UpdatedAt              time.Time
+}
+
+func (q *Queries) ResolvePendingReference(ctx context.Context, arg ResolvePendingReferenceParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resolvePendingReference,
+		arg.ID,
+		arg.Status,
+		arg.FailureCode,
+		arg.ResultBalance,
+		arg.ReferenceTransactionID,
+		arg.UpdatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

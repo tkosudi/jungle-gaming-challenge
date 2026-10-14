@@ -39,3 +39,16 @@ func (w Wallet) Debit(amount Money) (Wallet, error) {
 	}
 	return Wallet{ID: w.ID, PlayerID: w.PlayerID, Balance: balance, Version: w.Version + 1}, nil
 }
+
+// Credit devolve a carteira após o crédito; o receptor não é alterado. Estourar o limite do
+// int64 é erro (ErrAmountOverflow), nunca saldo truncado.
+func (w Wallet) Credit(amount Money) (Wallet, error) {
+	if !amount.IsPositive() {
+		return Wallet{}, ErrNonPositiveAmount
+	}
+	balance, err := w.Balance.Add(amount)
+	if err != nil {
+		return Wallet{}, err
+	}
+	return Wallet{ID: w.ID, PlayerID: w.PlayerID, Balance: balance, Version: w.Version + 1}, nil
+}

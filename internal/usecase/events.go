@@ -16,6 +16,7 @@ const (
 	eventTransactionProcessed = "WagerTransactionProcessed"
 	eventTransactionRejected  = "WagerTransactionRejected"
 	eventBalanceChanged       = "WalletBalanceChanged"
+	eventPendingReference     = "WagerTransactionPendingReference"
 )
 
 type moneyJSON struct {
@@ -30,18 +31,19 @@ func toMoneyJSON(m domain.Money) moneyJSON {
 // transactionEventData serve a WagerTransactionProcessed e WagerTransactionRejected; os campos
 // externos ficam ausentes na abertura interna (OPENING).
 type transactionEventData struct {
-	TransactionID         string     `json:"transactionId"`
-	WalletID              string     `json:"walletId,omitempty"`
-	PlayerID              string     `json:"playerId"`
-	ProviderID            string     `json:"providerId,omitempty"`
-	ExternalTransactionID string     `json:"externalTransactionId,omitempty"`
-	RoundID               string     `json:"roundId,omitempty"`
-	GameID                string     `json:"gameId,omitempty"`
-	Kind                  string     `json:"kind"`
-	Status                string     `json:"status"`
-	FailureCode           string     `json:"failureCode,omitempty"`
-	Money                 moneyJSON  `json:"money"`
-	Balance               *moneyJSON `json:"balance,omitempty"`
+	TransactionID                  string     `json:"transactionId"`
+	WalletID                       string     `json:"walletId,omitempty"`
+	PlayerID                       string     `json:"playerId"`
+	ProviderID                     string     `json:"providerId,omitempty"`
+	ExternalTransactionID          string     `json:"externalTransactionId,omitempty"`
+	RoundID                        string     `json:"roundId,omitempty"`
+	GameID                         string     `json:"gameId,omitempty"`
+	Kind                           string     `json:"kind"`
+	ReferenceExternalTransactionID string     `json:"referenceExternalTransactionId,omitempty"`
+	Status                         string     `json:"status"`
+	FailureCode                    string     `json:"failureCode,omitempty"`
+	Money                          moneyJSON  `json:"money"`
+	Balance                        *moneyJSON `json:"balance,omitempty"`
 }
 
 type balanceChangedData struct {

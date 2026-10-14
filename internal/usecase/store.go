@@ -43,33 +43,53 @@ type Tx interface {
 	UpdateWallet(ctx context.Context, w domain.Wallet, at time.Time) error
 
 	InsertOpeningTransaction(ctx context.Context, id uuid.UUID, w domain.Wallet, at time.Time) error
-	// InsertBetTransaction grava a BET; inserted=false se a chave ou o ID externo do provedor já existe.
-	InsertBetTransaction(ctx context.Context, t BetTransaction) (inserted bool, err error)
+	// InsertOperation grava a operação já decidida; inserted=false se a chave ou o ID externo
+	// do provedor já existe.
+	InsertOperation(ctx context.Context, r OperationRecord) (inserted bool, err error)
 	FindProviderOperations(ctx context.Context, providerID, idempotencyKey, externalID string) ([]StoredOperation, error)
+	// FindReference procura a transação do provedor com esse ID externo; nil se não existe.
+	// Chamado depois do lock da carteira: a leitura enxerga todo commit anterior dela.
+	FindReference(ctx context.Context, providerID, externalID string) (*domain.Reference, error)
+
+	// ClaimDuePendingReference escolhe uma pendência vencida travando a carteira dela com
+	// FOR UPDATE SKIP LOCKED (nunca espera por carteira ocupada). A linha da pendência não é
+	// travada: o lock da carteira basta e mantém a ordem carteira -> transação.
+	ClaimDuePendingReference(ctx context.Context) (claim PendingClaim, found bool, err error)
+	// LoadDuePendingReference relê a pendência em novo statement, depois do lock: found=false
+	// se outra instância a resolveu ou ela não está mais vencida.
+	LoadDuePendingReference(ctx context.Context, transactionID uuid.UUID) (op PendingOperation, found bool, err error)
+	// ResolvePendingReference leva PENDING_REFERENCE a um estado terminal.
+	ResolvePendingReference(ctx context.Context, r PendingResolution) error
+	// ReschedulePendingReference registra a tentativa e agenda a próxima pelo relógio do banco.
+	ReschedulePendingReference(ctx context.Context, transactionID uuid.UUID, attempts int, retryAfter time.Duration, at time.Time) error
 
 	InsertLedgerEntry(ctx context.Context, e LedgerEntry) error
 	InsertOutboxEvent(ctx context.Context, e OutboxEvent) error
 }
 
-// BetTransaction é a BET a persistir, já decidida: PROCESSED ou REJECTED.
-type BetTransaction struct {
+// OperationRecord é a operação a persistir, já decidida.
+type OperationRecord struct {
 	ID          uuid.UUID
 	WalletID    *uuid.UUID // nulo quando a carteira não existe ou não corresponde ao jogador/moeda
 	ProviderID  string
-	Bet         domain.Bet
+	Operation   domain.Operation
 	PayloadHash [32]byte
-	Status      string
+	Status      domain.Status
 	FailureCode string
 	// ResultBalance é o saldo informado ao provedor; é o que o replay devolve.
 	ResultBalance *domain.Money
-	At            time.Time
+	// ReferenceTransactionID é a referência resolvida; só em PROCESSED com referência.
+	ReferenceTransactionID *uuid.UUID
+	// RetryAfter agenda a primeira tentativa do worker (PENDING_REFERENCE), pelo relógio do banco.
+	RetryAfter time.Duration
+	At         time.Time
 }
 
 // StoredOperation é uma operação do provedor já persistida.
 type StoredOperation struct {
 	TransactionID         uuid.UUID
 	Kind                  string
-	Status                string
+	Status                domain.Status
 	IdempotencyKey        string
 	ExternalTransactionID string
 	PayloadHash           []byte
@@ -77,11 +97,36 @@ type StoredOperation struct {
 	ResultBalance         *domain.Money
 }
 
+// PendingClaim identifica a pendência escolhida e a carteira já travada para ela.
+type PendingClaim struct {
+	TransactionID uuid.UUID
+	WalletID      uuid.UUID
+}
+
+// PendingOperation é uma operação PENDING_REFERENCE reidratada do banco, sem reaplicar nada.
+type PendingOperation struct {
+	TransactionID uuid.UUID
+	ProviderID    string
+	Operation     domain.Operation
+	// Attempts é o número de tentativas do worker já registradas.
+	Attempts int
+}
+
+// PendingResolution é o estado terminal de uma pendência.
+type PendingResolution struct {
+	TransactionID          uuid.UUID
+	Status                 domain.Status
+	FailureCode            string
+	ResultBalance          *domain.Money
+	ReferenceTransactionID *uuid.UUID
+	At                     time.Time
+}
+
 type LedgerEntry struct {
 	ID            uuid.UUID
 	WalletID      uuid.UUID
 	TransactionID uuid.UUID
-	Direction     string // DEBIT ou CREDIT
+	Direction     domain.Direction
 	Amount        domain.Money
 	BalanceBefore domain.Money
 	BalanceAfter  domain.Money

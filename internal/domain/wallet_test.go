@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/google/uuid"
@@ -49,6 +50,41 @@ func TestWallet_DebitRejections(t *testing.T) {
 		t.Errorf("zero debit error = %v, want ErrNonPositiveAmount", err)
 	}
 	if _, err := w.Debit(usd); !errors.Is(err, ErrCurrencyMismatch) {
+		t.Errorf("other currency error = %v, want ErrCurrencyMismatch", err)
+	}
+}
+
+func TestWallet_Credit(t *testing.T) {
+	w := testWallet(t, "100.00")
+	amount, _ := NewMoney("25.50", "BRL")
+
+	got, err := w.Credit(amount)
+	if err != nil {
+		t.Fatalf("Credit() error = %v", err)
+	}
+	if got.Balance.Amount() != "125.50" || got.Version != 4 {
+		t.Errorf("Credit() = %s v%d, want 125.50 v4", got.Balance.Amount(), got.Version)
+	}
+	if w.Balance.Amount() != "100.00" || w.Version != 3 {
+		t.Error("Credit mutated the original wallet")
+	}
+}
+
+func TestWallet_CreditRejections(t *testing.T) {
+	maxed, _ := MoneyFromCents(math.MaxInt64, "BRL")
+	full := Wallet{ID: uuid.New(), PlayerID: uuid.New(), Balance: maxed, Version: 1}
+	one, _ := NewMoney("0.01", "BRL")
+	zero, _ := NewMoney("0.00", "BRL")
+	usd, _ := NewMoney("1.00", "USD")
+	w := testWallet(t, "100.00")
+
+	if _, err := full.Credit(one); !errors.Is(err, ErrAmountOverflow) {
+		t.Errorf("overflow error = %v, want ErrAmountOverflow", err)
+	}
+	if _, err := w.Credit(zero); !errors.Is(err, ErrNonPositiveAmount) {
+		t.Errorf("zero credit error = %v, want ErrNonPositiveAmount", err)
+	}
+	if _, err := w.Credit(usd); !errors.Is(err, ErrCurrencyMismatch) {
 		t.Errorf("other currency error = %v, want ErrCurrencyMismatch", err)
 	}
 }

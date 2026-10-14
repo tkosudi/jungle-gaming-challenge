@@ -119,28 +119,141 @@ func (t *pgTx) InsertOpeningTransaction(ctx context.Context, id uuid.UUID, w dom
 	})
 }
 
-func (t *pgTx) InsertBetTransaction(ctx context.Context, r usecase.BetTransaction) (bool, error) {
+func (t *pgTx) InsertOperation(ctx context.Context, r usecase.OperationRecord) (bool, error) {
+	op := r.Operation
 	var resultBalance *int64
 	if r.ResultBalance != nil {
 		cents := r.ResultBalance.Cents()
 		resultBalance = &cents
 	}
-	var failureCode *string
+	var failureCode, reference *string
 	if r.FailureCode != "" {
 		failureCode = &r.FailureCode
 	}
-	_, err := t.q.InsertBetTransaction(ctx, sqlc.InsertBetTransactionParams{
-		ID: r.ID, Status: r.Status, WalletID: r.WalletID, PlayerID: r.Bet.PlayerID,
-		Amount: r.Bet.Money.Cents(), Currency: string(r.Bet.Money.Currency()),
-		ProviderID: &r.ProviderID, ExternalTransactionID: &r.Bet.ExternalTransactionID,
-		IdempotencyKey: &r.Bet.IdempotencyKey, PayloadHash: r.PayloadHash[:],
-		RoundID: &r.Bet.RoundID, GameID: &r.Bet.GameID,
-		FailureCode: failureCode, ResultBalance: resultBalance, CreatedAt: r.At,
+	if op.ReferenceExternalTransactionID != "" {
+		reference = &op.ReferenceExternalTransactionID
+	}
+	kind := string(op.Kind)
+	_, err := t.q.InsertOperation(ctx, sqlc.InsertOperationParams{
+		ID: r.ID, Kind: kind, Status: string(r.Status), WalletID: r.WalletID, PlayerID: op.PlayerID,
+		Amount: op.Money.Cents(), Currency: string(op.Money.Currency()),
+		ProviderID: &r.ProviderID, ExternalTransactionID: &op.ExternalTransactionID,
+		IdempotencyKey: &op.IdempotencyKey, PayloadHash: r.PayloadHash[:],
+		RoundID: &op.RoundID, GameID: &op.GameID,
+		ReferenceExternalTransactionID: reference, ReferenceTransactionID: r.ReferenceTransactionID,
+		FailureCode: failureCode, ResultBalance: resultBalance,
+		Column18:  r.RetryAfter.Milliseconds(), // atraso da primeira tentativa (só PENDING_REFERENCE)
+		CreatedAt: r.At,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	return err == nil, err
+}
+
+func (t *pgTx) FindReference(ctx context.Context, providerID, externalID string) (*domain.Reference, error) {
+	row, err := t.q.FindReferenceTransaction(ctx, sqlc.FindReferenceTransactionParams{
+		ProviderID: &providerID, ExternalTransactionID: &externalID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	amount, err := domain.MoneyFromCents(row.Amount, domain.Currency(row.Currency))
+	if err != nil {
+		return nil, fmt.Errorf("reference %s amount: %w", row.ID, err)
+	}
+	ref := &domain.Reference{
+		TransactionID: row.ID, Kind: domain.Kind(row.Kind), Status: domain.Status(row.Status),
+		PlayerID: row.PlayerID, WalletID: row.WalletID, Money: amount, Compensated: row.Compensated,
+	}
+	if row.RoundID != nil {
+		ref.RoundID = *row.RoundID
+	}
+	return ref, nil
+}
+
+func (t *pgTx) ClaimDuePendingReference(ctx context.Context) (usecase.PendingClaim, bool, error) {
+	row, err := t.q.ClaimDuePendingReference(ctx)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return usecase.PendingClaim{}, false, nil
+	}
+	if err != nil {
+		return usecase.PendingClaim{}, false, err
+	}
+	if row.WalletID == nil {
+		return usecase.PendingClaim{}, false, fmt.Errorf("pending transaction %s has no wallet", row.ID)
+	}
+	return usecase.PendingClaim{TransactionID: row.ID, WalletID: *row.WalletID}, true, nil
+}
+
+// LoadDuePendingReference reidrata a operação a partir da linha; não há criação nem validação
+// de entrada nova: os campos foram validados quando a operação foi aceita.
+func (t *pgTx) LoadDuePendingReference(ctx context.Context, id uuid.UUID) (usecase.PendingOperation, bool, error) {
+	row, err := t.q.GetDuePendingReference(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return usecase.PendingOperation{}, false, nil
+	}
+	if err != nil {
+		return usecase.PendingOperation{}, false, err
+	}
+	amount, err := domain.MoneyFromCents(row.Amount, domain.Currency(row.Currency))
+	if err != nil {
+		return usecase.PendingOperation{}, false, fmt.Errorf("pending transaction %s amount: %w", row.ID, err)
+	}
+	if row.WalletID == nil || row.ProviderID == nil || row.ExternalTransactionID == nil ||
+		row.IdempotencyKey == nil || row.RoundID == nil || row.GameID == nil || row.ReferenceExternalTransactionID == nil {
+		return usecase.PendingOperation{}, false, fmt.Errorf("pending transaction %s has missing fields", row.ID)
+	}
+	return usecase.PendingOperation{
+		TransactionID: row.ID,
+		ProviderID:    *row.ProviderID,
+		Attempts:      int(row.ReferenceAttempts),
+		Operation: domain.Operation{
+			Kind: domain.Kind(row.Kind), ExternalTransactionID: *row.ExternalTransactionID,
+			IdempotencyKey: *row.IdempotencyKey, PlayerID: row.PlayerID, WalletID: *row.WalletID,
+			RoundID: *row.RoundID, GameID: *row.GameID, Money: amount,
+			ReferenceExternalTransactionID: *row.ReferenceExternalTransactionID,
+		},
+	}, true, nil
+}
+
+func (t *pgTx) ResolvePendingReference(ctx context.Context, r usecase.PendingResolution) error {
+	var failureCode *string
+	if r.FailureCode != "" {
+		failureCode = &r.FailureCode
+	}
+	var resultBalance *int64
+	if r.ResultBalance != nil {
+		cents := r.ResultBalance.Cents()
+		resultBalance = &cents
+	}
+	n, err := t.q.ResolvePendingReference(ctx, sqlc.ResolvePendingReferenceParams{
+		ID: r.TransactionID, Status: string(r.Status), FailureCode: failureCode,
+		ResultBalance: resultBalance, ReferenceTransactionID: r.ReferenceTransactionID, UpdatedAt: r.At,
+	})
+	return requireOneRow(n, err, r.TransactionID)
+}
+
+func (t *pgTx) ReschedulePendingReference(ctx context.Context, id uuid.UUID, attempts int, retryAfter time.Duration, at time.Time) error {
+	n, err := t.q.ReschedulePendingReference(ctx, sqlc.ReschedulePendingReferenceParams{
+		ID: id, ReferenceAttempts: int32(attempts), Column3: retryAfter.Milliseconds(), UpdatedAt: at,
+	})
+	return requireOneRow(n, err, id)
+}
+
+// requireOneRow: o worker segura o lock da carteira e revalidou a pendência; atualizar zero
+// linhas significa que a premissa de exclusão foi violada, e o passo deve falhar.
+func requireOneRow(n int64, err error, id uuid.UUID) error {
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("pending transaction %s was not in PENDING_REFERENCE", id)
+	}
+	return nil
 }
 
 func (t *pgTx) FindProviderOperations(ctx context.Context, providerID, idempotencyKey, externalID string) ([]usecase.StoredOperation, error) {
@@ -153,7 +266,7 @@ func (t *pgTx) FindProviderOperations(ctx context.Context, providerID, idempoten
 	ops := make([]usecase.StoredOperation, 0, len(rows))
 	for _, row := range rows {
 		op := usecase.StoredOperation{
-			TransactionID: row.ID, Kind: row.Kind, Status: row.Status, PayloadHash: row.PayloadHash,
+			TransactionID: row.ID, Kind: row.Kind, Status: domain.Status(row.Status), PayloadHash: row.PayloadHash,
 		}
 		if row.IdempotencyKey != nil {
 			op.IdempotencyKey = *row.IdempotencyKey
@@ -178,7 +291,7 @@ func (t *pgTx) FindProviderOperations(ctx context.Context, providerID, idempoten
 
 func (t *pgTx) InsertLedgerEntry(ctx context.Context, e usecase.LedgerEntry) error {
 	return t.q.InsertLedgerEntry(ctx, sqlc.InsertLedgerEntryParams{
-		ID: e.ID, WalletID: e.WalletID, TransactionID: e.TransactionID, Direction: e.Direction,
+		ID: e.ID, WalletID: e.WalletID, TransactionID: e.TransactionID, Direction: string(e.Direction),
 		Amount: e.Amount.Cents(), BalanceBefore: e.BalanceBefore.Cents(), BalanceAfter: e.BalanceAfter.Cents(),
 		WalletVersion: e.WalletVersion, CreatedAt: e.At,
 	})

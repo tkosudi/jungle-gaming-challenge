@@ -20,11 +20,25 @@ import (
 // "Instâncias" aqui são pools e serviços independentes (conexões próprias) no mesmo processo
 // de teste; não substituem o teste com três processos, que fica para o milestone distribuído.
 
+func newTestService(t *testing.T, store usecase.Store, policy usecase.ReferencePolicy) *usecase.Service {
+	t.Helper()
+	svc, err := usecase.NewService(store, policy)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	return svc
+}
+
 func (db *schemaDB) instances(t *testing.T, n int) []*usecase.Service {
+	t.Helper()
+	return db.instancesWith(t, n, usecase.DefaultReferencePolicy())
+}
+
+func (db *schemaDB) instancesWith(t *testing.T, n int, policy usecase.ReferencePolicy) []*usecase.Service {
 	t.Helper()
 	services := make([]*usecase.Service, n)
 	for i := range services {
-		services[i] = usecase.NewService(NewStore(openPool(t, db.url), 5*time.Second))
+		services[i] = newTestService(t, NewStore(openPool(t, db.url), 5*time.Second), policy)
 	}
 	return services
 }
@@ -47,9 +61,10 @@ func openFunded(t *testing.T, svc *usecase.Service, amount string) domain.Wallet
 	return res.Wallet
 }
 
-func newBet(t *testing.T, w domain.Wallet, external, key, amount string) domain.Bet {
+func newBet(t *testing.T, w domain.Wallet, external, key, amount string) domain.Operation {
 	t.Helper()
-	b, err := domain.NewBet(domain.BetInput{
+	b, err := domain.NewOperation(domain.OperationInput{
+		Kind:                  "BET",
 		ExternalTransactionID: external,
 		IdempotencyKey:        key,
 		PlayerID:              w.PlayerID.String(),
@@ -228,14 +243,14 @@ func TestOpenWallet_ConcurrentCreatesOneWalletAndOneCredit(t *testing.T) {
 
 // --- BET --------------------------------------------------------------------
 
-func TestPlaceBet_ProcessedWritesTransactionWalletLedgerAndOutbox(t *testing.T) {
+func TestProcess_ProcessedWritesTransactionWalletLedgerAndOutbox(t *testing.T) {
 	db := newSchemaDB(t)
 	svc := db.instances(t, 1)[0]
 	ctx := context.Background()
 	w := openFunded(t, svc, "100.00")
 	bet := newBet(t, w, "tx-1", "provider-a:tx-1", "25.00")
 
-	res, err := svc.PlaceBet(ctx, "provider-a", bet)
+	res, err := svc.Process(ctx, "provider-a", bet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,20 +311,20 @@ func TestPlaceBet_ProcessedWritesTransactionWalletLedgerAndOutbox(t *testing.T) 
 	}
 }
 
-func TestPlaceBet_TwoBetsOf80OnBalance100(t *testing.T) {
+func TestProcess_TwoBetsOf80OnBalance100(t *testing.T) {
 	db := newSchemaDB(t)
 	instances := db.instances(t, 3)
 
 	for round := 0; round < 10; round++ {
 		w := openFunded(t, instances[0], "100.00")
-		bets := []domain.Bet{
+		bets := []domain.Operation{
 			newBet(t, w, fmt.Sprintf("tx-a-%d", round), fmt.Sprintf("provider-a:tx-a-%d", round), "80.00"),
 			newBet(t, w, fmt.Sprintf("tx-b-%d", round), fmt.Sprintf("provider-a:tx-b-%d", round), "80.00"),
 		}
-		results := make([]usecase.BetResult, 2)
+		results := make([]usecase.Result, 2)
 		errs := make([]error, 2)
 		runConcurrently(2, func(i int) {
-			results[i], errs[i] = instances[(i+1)%3].PlaceBet(context.Background(), "provider-a", bets[i])
+			results[i], errs[i] = instances[(i+1)%3].Process(context.Background(), "provider-a", bets[i])
 		})
 
 		processed, rejected := 0, 0
@@ -339,17 +354,17 @@ func TestPlaceBet_TwoBetsOf80OnBalance100(t *testing.T) {
 	}
 }
 
-func TestPlaceBet_FiftyIdenticalRequestsDebitOnce(t *testing.T) {
+func TestProcess_FiftyIdenticalRequestsDebitOnce(t *testing.T) {
 	db := newSchemaDB(t)
 	instances := db.instances(t, 3)
 	w := openFunded(t, instances[0], "100.00")
 	bet := newBet(t, w, "tx-1", "provider-a:tx-1", "25.00")
 
 	const requests = 50
-	results := make([]usecase.BetResult, requests)
+	results := make([]usecase.Result, requests)
 	errs := make([]error, requests)
 	runConcurrently(requests, func(i int) {
-		results[i], errs[i] = instances[i%len(instances)].PlaceBet(context.Background(), "provider-a", bet)
+		results[i], errs[i] = instances[i%len(instances)].Process(context.Background(), "provider-a", bet)
 	})
 
 	originals := 0
@@ -382,13 +397,13 @@ func TestPlaceBet_FiftyIdenticalRequestsDebitOnce(t *testing.T) {
 	}
 }
 
-func TestPlaceBet_IdempotencyConflictsAndReplays(t *testing.T) {
+func TestProcess_IdempotencyConflictsAndReplays(t *testing.T) {
 	db := newSchemaDB(t)
 	svc := db.instances(t, 1)[0]
 	ctx := context.Background()
 	w := openFunded(t, svc, "100.00")
 	first := newBet(t, w, "tx-1", "provider-a:tx-1", "25.00")
-	original, err := svc.PlaceBet(ctx, "provider-a", first)
+	original, err := svc.Process(ctx, "provider-a", first)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,38 +418,38 @@ func TestPlaceBet_IdempotencyConflictsAndReplays(t *testing.T) {
 	}
 
 	t.Run("same key and payload is a replay", func(t *testing.T) {
-		res, err := svc.PlaceBet(ctx, "provider-a", first)
+		res, err := svc.Process(ctx, "provider-a", first)
 		if err != nil || !res.Replay || res.TransactionID != original.TransactionID || res.Status != "PROCESSED" {
 			t.Fatalf("replay = %+v, %v", res, err)
 		}
 		unchanged(t)
 	})
 	t.Run("same key with another payload conflicts", func(t *testing.T) {
-		_, err := svc.PlaceBet(ctx, "provider-a", newBet(t, w, "tx-1", "provider-a:tx-1", "26.00"))
+		_, err := svc.Process(ctx, "provider-a", newBet(t, w, "tx-1", "provider-a:tx-1", "26.00"))
 		if !errors.Is(err, usecase.ErrIdempotencyConflict) {
 			t.Fatalf("error = %v, want ErrIdempotencyConflict", err)
 		}
 		unchanged(t)
 	})
 	t.Run("same external id with another key conflicts", func(t *testing.T) {
-		_, err := svc.PlaceBet(ctx, "provider-a", newBet(t, w, "tx-1", "another-key", "25.00"))
+		_, err := svc.Process(ctx, "provider-a", newBet(t, w, "tx-1", "another-key", "25.00"))
 		if !errors.Is(err, usecase.ErrIdempotencyConflict) {
 			t.Fatalf("error = %v, want ErrIdempotencyConflict", err)
 		}
 		unchanged(t)
 	})
 	t.Run("same key with another external id conflicts", func(t *testing.T) {
-		_, err := svc.PlaceBet(ctx, "provider-a", newBet(t, w, "tx-other", "provider-a:tx-1", "25.00"))
+		_, err := svc.Process(ctx, "provider-a", newBet(t, w, "tx-other", "provider-a:tx-1", "25.00"))
 		if !errors.Is(err, usecase.ErrIdempotencyConflict) {
 			t.Fatalf("error = %v, want ErrIdempotencyConflict", err)
 		}
 		unchanged(t)
 	})
 	t.Run("replay returns the historical balance after other movements", func(t *testing.T) {
-		if res, err := svc.PlaceBet(ctx, "provider-a", newBet(t, w, "tx-2", "provider-a:tx-2", "50.00")); err != nil || res.Status != "PROCESSED" {
+		if res, err := svc.Process(ctx, "provider-a", newBet(t, w, "tx-2", "provider-a:tx-2", "50.00")); err != nil || res.Status != "PROCESSED" {
 			t.Fatalf("second bet = %+v, %v", res, err)
 		}
-		res, err := svc.PlaceBet(ctx, "provider-a", first)
+		res, err := svc.Process(ctx, "provider-a", first)
 		if err != nil || !res.Replay || res.Balance == nil || res.Balance.Amount() != "75.00" {
 			t.Fatalf("replay = %+v, %v; want historical balance 75.00", res, err)
 		}
@@ -444,7 +459,7 @@ func TestPlaceBet_IdempotencyConflictsAndReplays(t *testing.T) {
 	})
 	t.Run("same identifiers under another provider are independent", func(t *testing.T) {
 		before, _ := db.walletState(t, w.ID)
-		res, err := svc.PlaceBet(ctx, "provider-b", first)
+		res, err := svc.Process(ctx, "provider-b", first)
 		if err != nil || res.Replay || res.Status != "PROCESSED" || res.TransactionID == original.TransactionID {
 			t.Fatalf("provider-b result = %+v, %v", res, err)
 		}
@@ -455,14 +470,14 @@ func TestPlaceBet_IdempotencyConflictsAndReplays(t *testing.T) {
 	})
 }
 
-func TestPlaceBet_RejectionIsPersistedAndReplayedAfterNewCredit(t *testing.T) {
+func TestProcess_RejectionIsPersistedAndReplayedAfterNewCredit(t *testing.T) {
 	db := newSchemaDB(t)
 	svc := db.instances(t, 1)[0]
 	ctx := context.Background()
 	w := openFunded(t, svc, "10.00")
 	bet := newBet(t, w, "tx-1", "provider-a:tx-1", "50.00")
 
-	rejected, err := svc.PlaceBet(ctx, "provider-a", bet)
+	rejected, err := svc.Process(ctx, "provider-a", bet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +498,7 @@ func TestPlaceBet_RejectionIsPersistedAndReplayedAfterNewCredit(t *testing.T) {
 	credit := newExternalTx(wallet{id: w.ID.String(), playerID: w.PlayerID.String(), currency: "BRL", balance: 1000, version: 1}, "WIN", 10000)
 	db.move(t, wallet{id: w.ID.String(), playerID: w.PlayerID.String(), currency: "BRL", balance: 1000, version: 1}, credit, "CREDIT")
 
-	replay, err := svc.PlaceBet(ctx, "provider-a", bet)
+	replay, err := svc.Process(ctx, "provider-a", bet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +514,7 @@ func TestPlaceBet_RejectionIsPersistedAndReplayedAfterNewCredit(t *testing.T) {
 	}
 }
 
-func TestPlaceBet_WalletProblemsArePersistedRejections(t *testing.T) {
+func TestProcess_WalletProblemsArePersistedRejections(t *testing.T) {
 	db := newSchemaDB(t)
 	svc := db.instances(t, 1)[0]
 	ctx := context.Background()
@@ -507,34 +522,35 @@ func TestPlaceBet_WalletProblemsArePersistedRejections(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		mutate   func(*domain.BetInput)
+		mutate   func(*domain.OperationInput)
 		wantCode string
 	}{
-		{"unknown wallet", func(in *domain.BetInput) { in.WalletID = uuid.NewString() }, "WALLET_NOT_FOUND"},
-		{"wallet of another player", func(in *domain.BetInput) { in.PlayerID = uuid.NewString() }, "WALLET_NOT_FOUND"},
-		{"currency differs from the wallet", func(in *domain.BetInput) { in.Currency = "USD" }, "CURRENCY_MISMATCH"},
+		{"unknown wallet", func(in *domain.OperationInput) { in.WalletID = uuid.NewString() }, "WALLET_NOT_FOUND"},
+		{"wallet of another player", func(in *domain.OperationInput) { in.PlayerID = uuid.NewString() }, "WALLET_NOT_FOUND"},
+		{"currency differs from the wallet", func(in *domain.OperationInput) { in.Currency = "USD" }, "CURRENCY_MISMATCH"},
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			in := domain.BetInput{
+			in := domain.OperationInput{
+				Kind:                  "BET",
 				ExternalTransactionID: "tx-" + tc.wantCode + string(rune('a'+i)),
 				IdempotencyKey:        "key-" + tc.wantCode + string(rune('a'+i)),
 				PlayerID:              w.PlayerID.String(), WalletID: w.ID.String(),
 				RoundID: "r", GameID: "g", Amount: "10.00", Currency: "BRL",
 			}
 			tc.mutate(&in)
-			bet, err := domain.NewBet(in)
+			bet, err := domain.NewOperation(in)
 			if err != nil {
 				t.Fatal(err)
 			}
-			res, err := svc.PlaceBet(ctx, "provider-a", bet)
+			res, err := svc.Process(ctx, "provider-a", bet)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if res.Status != "REJECTED" || res.FailureCode != tc.wantCode || res.Balance != nil {
 				t.Fatalf("result = %+v, want REJECTED %s", res, tc.wantCode)
 			}
-			again, err := svc.PlaceBet(ctx, "provider-a", bet)
+			again, err := svc.Process(ctx, "provider-a", bet)
 			if err != nil || !again.Replay || again.TransactionID != res.TransactionID || again.FailureCode != tc.wantCode {
 				t.Fatalf("replay = %+v, %v", again, err)
 			}
@@ -548,12 +564,12 @@ func TestPlaceBet_WalletProblemsArePersistedRejections(t *testing.T) {
 	}
 }
 
-func TestPlaceBet_SameKeyOnDifferentWalletsDebitsOnlyOnce(t *testing.T) {
+func TestProcess_SameKeyOnDifferentWalletsDebitsOnlyOnce(t *testing.T) {
 	db := newSchemaDB(t)
 	instances := db.instances(t, 3)
 	walletA := openFunded(t, instances[0], "100.00")
 	walletB := openFunded(t, instances[0], "100.00")
-	bets := []domain.Bet{
+	bets := []domain.Operation{
 		newBet(t, walletA, "tx-1", "provider-a:tx-1", "25.00"),
 		newBet(t, walletB, "tx-1", "provider-a:tx-1", "25.00"),
 	}
@@ -561,10 +577,10 @@ func TestPlaceBet_SameKeyOnDifferentWalletsDebitsOnlyOnce(t *testing.T) {
 	for round := 0; round < 5; round++ {
 		bets[0].ExternalTransactionID, bets[1].ExternalTransactionID = "tx-"+string(rune('1'+round)), "tx-"+string(rune('1'+round))
 		bets[0].IdempotencyKey, bets[1].IdempotencyKey = "k"+string(rune('1'+round)), "k"+string(rune('1'+round))
-		results := make([]usecase.BetResult, 2)
+		results := make([]usecase.Result, 2)
 		errs := make([]error, 2)
 		runConcurrently(2, func(i int) {
-			results[i], errs[i] = instances[i+1].PlaceBet(context.Background(), "provider-a", bets[i])
+			results[i], errs[i] = instances[i+1].Process(context.Background(), "provider-a", bets[i])
 		})
 		ok, conflicts := 0, 0
 		for i := range results {
@@ -588,7 +604,7 @@ func TestPlaceBet_SameKeyOnDifferentWalletsDebitsOnlyOnce(t *testing.T) {
 	}
 }
 
-func TestPlaceBet_FailureLeavesNoPartialState(t *testing.T) {
+func TestProcess_FailureLeavesNoPartialState(t *testing.T) {
 	// Falhas controladas do banco (triggers criados só no banco de teste), nunca no código de produção:
 	// uma imediata, no INSERT do evento, e uma diferida, que só dispara no COMMIT.
 	scenarios := []struct {
@@ -613,9 +629,9 @@ func TestPlaceBet_FailureLeavesNoPartialState(t *testing.T) {
 			outboxBefore := db.count(t, `SELECT count(*) FROM outbox_events`)
 
 			db.mustExec(t, sc.ddl)
-			_, err := svc.PlaceBet(ctx, "provider-a", bet)
+			_, err := svc.Process(ctx, "provider-a", bet)
 			if err == nil {
-				t.Fatal("PlaceBet succeeded despite the forced failure")
+				t.Fatal("Process succeeded despite the forced failure")
 			}
 			if errors.Is(err, usecase.ErrCommitUnknown) {
 				t.Fatalf("a server-reported failure must not be classified as unknown: %v", err)
@@ -636,7 +652,7 @@ func TestPlaceBet_FailureLeavesNoPartialState(t *testing.T) {
 
 			// A mesma requisição, depois que a falha some, é processada normalmente, uma única vez.
 			db.mustExec(t, `DROP TRIGGER test_fail ON outbox_events; DROP FUNCTION test_fail()`)
-			res, err := svc.PlaceBet(ctx, "provider-a", bet)
+			res, err := svc.Process(ctx, "provider-a", bet)
 			if err != nil || res.Status != "PROCESSED" || res.Replay {
 				t.Fatalf("retry = %+v, %v", res, err)
 			}
@@ -647,7 +663,7 @@ func TestPlaceBet_FailureLeavesNoPartialState(t *testing.T) {
 	}
 }
 
-func TestPlaceBet_DifferentWalletsDoNotBlockEachOtherButSameWalletSerializes(t *testing.T) {
+func TestProcess_DifferentWalletsDoNotBlockEachOtherButSameWalletSerializes(t *testing.T) {
 	db := newSchemaDB(t)
 	svc := db.instances(t, 1)[0]
 	ctx := context.Background()
@@ -666,14 +682,14 @@ func TestPlaceBet_DifferentWalletsDoNotBlockEachOtherButSameWalletSerializes(t *
 
 	blocked := make(chan error, 1)
 	go func() {
-		_, err := svc.PlaceBet(ctx, "provider-a", newBet(t, locked, "tx-l", "key-l", "10.00"))
+		_, err := svc.Process(ctx, "provider-a", newBet(t, locked, "tx-l", "key-l", "10.00"))
 		blocked <- err
 	}()
 
 	// A outra carteira não espera pelo lock.
 	freeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	if res, err := svc.PlaceBet(freeCtx, "provider-a", newBet(t, free, "tx-f", "key-f", "10.00")); err != nil || res.Status != "PROCESSED" {
+	if res, err := svc.Process(freeCtx, "provider-a", newBet(t, free, "tx-f", "key-f", "10.00")); err != nil || res.Status != "PROCESSED" {
 		t.Fatalf("independent wallet = %+v, %v", res, err)
 	}
 
@@ -698,7 +714,7 @@ func TestPlaceBet_DifferentWalletsDoNotBlockEachOtherButSameWalletSerializes(t *
 	}
 }
 
-func TestPlaceBet_LockTimeoutAndCancellationPersistNothing(t *testing.T) {
+func TestProcess_LockTimeoutAndCancellationPersistNothing(t *testing.T) {
 	db := newSchemaDB(t)
 	setup := db.instances(t, 1)[0]
 	ctx := context.Background()
@@ -714,8 +730,8 @@ func TestPlaceBet_LockTimeoutAndCancellationPersistNothing(t *testing.T) {
 	}
 
 	t.Run("lock timeout", func(t *testing.T) {
-		svc := usecase.NewService(NewStore(openPool(t, db.url), 200*time.Millisecond))
-		_, err := svc.PlaceBet(ctx, "provider-a", newBet(t, w, "tx-1", "key-1", "10.00"))
+		svc := newTestService(t, NewStore(openPool(t, db.url), 200*time.Millisecond), usecase.DefaultReferencePolicy())
+		_, err := svc.Process(ctx, "provider-a", newBet(t, w, "tx-1", "key-1", "10.00"))
 		if !errors.Is(err, usecase.ErrLockTimeout) {
 			t.Fatalf("error = %v, want ErrLockTimeout", err)
 		}
@@ -723,9 +739,9 @@ func TestPlaceBet_LockTimeoutAndCancellationPersistNothing(t *testing.T) {
 	t.Run("context cancelled while waiting", func(t *testing.T) {
 		cctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
 		defer cancel()
-		_, err := setup.PlaceBet(cctx, "provider-a", newBet(t, w, "tx-2", "key-2", "10.00"))
+		_, err := setup.Process(cctx, "provider-a", newBet(t, w, "tx-2", "key-2", "10.00"))
 		if err == nil {
-			t.Fatal("PlaceBet succeeded with an expired context")
+			t.Fatal("Process succeeded with an expired context")
 		}
 	})
 
@@ -740,11 +756,11 @@ func TestPlaceBet_LockTimeoutAndCancellationPersistNothing(t *testing.T) {
 	}
 }
 
-func TestPlaceBet_RejectsMissingProvider(t *testing.T) {
+func TestProcess_RejectsMissingProvider(t *testing.T) {
 	db := newSchemaDB(t)
 	svc := db.instances(t, 1)[0]
 	w := openFunded(t, svc, "100.00")
-	_, err := svc.PlaceBet(context.Background(), "", newBet(t, w, "tx-1", "key-1", "10.00"))
+	_, err := svc.Process(context.Background(), "", newBet(t, w, "tx-1", "key-1", "10.00"))
 	if !errors.Is(err, usecase.ErrInvalidProvider) {
 		t.Fatalf("error = %v, want ErrInvalidProvider", err)
 	}
@@ -759,31 +775,10 @@ func TestOutbox_MigrationUpDownUpKeepsFinancialSchema(t *testing.T) {
 		t.Fatalf("migrate to 1: %v", err)
 	}
 	db := &schemaDB{pool: openPool(t, dbURL), url: dbURL}
-	snapshot := func() []string {
-		t.Helper()
-		rows, err := db.pool.Query(context.Background(), `
-			SELECT 'rel:' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-			 WHERE n.nspname = 'public' AND c.relname NOT LIKE 'schema_migrations%'
-			UNION ALL SELECT 'fn:' || p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public'
-			UNION ALL SELECT 'trg:' || tgname FROM pg_trigger WHERE NOT tgisinternal
-			ORDER BY 1`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer rows.Close()
-		var out []string
-		for rows.Next() {
-			var s string
-			if err := rows.Scan(&s); err != nil {
-				t.Fatal(err)
-			}
-			out = append(out, s)
-		}
-		return out
-	}
+	snapshot := func() []string { return db.objectSnapshot(t) }
 	baseline := snapshot()
 
-	if err := m.Up(); err != nil {
+	if err := m.Migrate(2); err != nil {
 		t.Fatalf("up: %v", err)
 	}
 	withOutbox := snapshot()
@@ -802,7 +797,7 @@ func TestOutbox_MigrationUpDownUpKeepsFinancialSchema(t *testing.T) {
 			t.Fatalf("object %d after down = %q, want %q", i, after[i], baseline[i])
 		}
 	}
-	if err := m.Up(); err != nil {
+	if err := m.Migrate(2); err != nil {
 		t.Fatalf("second up: %v", err)
 	}
 	if got := snapshot(); len(got) != len(withOutbox) {
@@ -815,7 +810,7 @@ func TestOutbox_PayloadIsImmutableAndEventsAreUniquePerTransaction(t *testing.T)
 	svc := db.instances(t, 1)[0]
 	ctx := context.Background()
 	w := openFunded(t, svc, "100.00")
-	res, err := svc.PlaceBet(ctx, "provider-a", newBet(t, w, "tx-1", "key-1", "10.00"))
+	res, err := svc.Process(ctx, "provider-a", newBet(t, w, "tx-1", "key-1", "10.00"))
 	if err != nil {
 		t.Fatal(err)
 	}
