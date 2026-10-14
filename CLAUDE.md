@@ -121,3 +121,34 @@ Confira e responda objetivamente:
 **Para funcionalidades novas:** mantenha RED → GREEN → REFACTOR com evidências reais. **Para refatoração pura:** execute a suíte existente antes e depois, prove que o comportamento foi preservado e não invente uma etapa RED artificial. Se alterar contratos, erros, rotas ou semântica, trate como mudança funcional e exija testes apropriados.
 
 No relatório final, separe: (a) complexidade essencial imposta pelos requisitos; (b) complexidade evitada/removida; (c) trade-offs e garantias preservadas. Se a opção mais curta piorar a segurança ou a clareza, mantenha a opção mais explícita.
+
+### Política de comentários e documentação
+
+O código destinado ao GitHub deve ser profissional, legível e autoexplicativo sempre que possível. Comentários não devem substituir nomes claros, funções pequenas ou responsabilidades bem definidas.
+
+**Escreva comentários somente quando agregarem informação que não esteja evidente no código:**
+
+- Explique o motivo de decisões técnicas não óbvias, limitações e trade-offs relevantes.
+- Documente invariantes financeiras, garantias de concorrência, idempotência, atomicidade, locking, compensações e condições de falha.
+- Explique comportamentos delicados de lifecycle, shutdown, retries e recuperação de recursos quando necessário.
+- Preserve diretivas essenciais como `//go:build integration`.
+- Utilize comentários GoDoc em APIs públicas quando ajudarem a compreender o contrato.
+
+**Evite:**
+
+- Comentários que apenas repetem o que a função ou instrução já faz.
+- Tutoriais, explicações linha por linha ou comentários excessivamente didáticos.
+- Comentários decorativos, cabeçalhos redundantes e código comentado sem justificativa.
+- Referências ao processo de geração por IA, prompts ou conversas de desenvolvimento.
+- Comentários extensos para explicar decisões que pertencem ao README ou ao ARCHITECTURE.md.
+
+**Critério obrigatório:** se o comentário for removido, o leitor perderá alguma informação importante para compreender, utilizar ou manter corretamente o código?
+
+- Se sim, preserve-o de forma clara e concisa.
+- Se não, prefira removê-lo.
+
+Explicações detalhadas para estudo e preparação de entrevistas devem ficar em documentos privados, separados do código versionado.
+
+Não remova comentários técnicos úteis apenas para reduzir o número de linhas. Não simplifique código sacrificando segurança, observabilidade, tratamento de erros ou requisitos financeiros.
+
+Antes de concluir cada milestone, revise também a qualidade e a necessidade dos comentários adicionados.
