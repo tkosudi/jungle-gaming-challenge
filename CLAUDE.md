@@ -29,7 +29,7 @@ Se uma decisão arquitetural relevante não estiver documentada, **pare apenas a
 - Go 1.26+ (compatível com Fiber v3), mesma versão principal em `go.mod` e Dockerfile.
 - Uber Fx para composição e lifecycle; Fiber v3 para HTTP.
 - PostgreSQL com pgx/v5; sqlc para código tipado, com SQL explícito.
-- Atlas e migrations versionadas, condicionado à prova de reversão reproduzível. Se não for possível, reporte antes de trocar de ferramenta.
+- golang-migrate (biblioteca v4.20.1 nos testes; CLI `migrate/migrate:v4.20.1`) com migrations `.up.sql`/`.down.sql` escritas à mão e reversão comprovada por teste (`up → down → up`). O Atlas foi avaliado e descartado (ver `ARCHITECTURE.md`); reabri-lo exige nova prova de reversão e aprovação.
 - Keycloak com OAuth 2.0/OIDC; AWS SDK para SQS e LocalStack no desenvolvimento.
 - Docker Compose para execução local.
 - Monólito modular como orientação de organização, com instâncias independentes.
