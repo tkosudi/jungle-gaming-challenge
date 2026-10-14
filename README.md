@@ -2,7 +2,7 @@
 
 Implementação do desafio técnico de processamento financeiro distribuído de apostas com API HTTP e mensagens SQS.
 
-> **Status:** M0.1 a M1.3 (núcleo financeiro), M2 e M2.1 (API HTTP com autenticação OIDC via Keycloak e reconciliação) implementados e testados; SQS, laço automático do worker e publicador da outbox ainda não existem. Detalhes em [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> **Status:** M0.1 a M1.3 (núcleo financeiro), M2/M2.1 (API HTTP com OIDC e reconciliação) e M3 (consumidor SQS FIFO com inbox, publicador da outbox e workers) implementados e testados. Pendentes: teste com três processos independentes e IAM real do broker. Detalhes em [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Documentos
 
@@ -16,7 +16,7 @@ Go 1.26+, Uber Fx, Fiber v3, PostgreSQL, pgx/v5, sqlc, golang-migrate v4.20.1 (b
 
 ## Como executar
 
-Disponível hoje: a API HTTP autenticada (carteiras, operações BET/WIN/LOSS/REFUND/ROLLBACK, consultas e reconciliação), health checks, `GET /metrics` (Prometheus) e as migrations. Não existem ainda consumidor SQS nem publicador da outbox (ver "Estado da entrega").
+Disponível hoje: a API HTTP autenticada (carteiras, operações BET/WIN/LOSS/REFUND/ROLLBACK, consultas e reconciliação), o consumidor da fila `wager-transactions.fifo` (com DLQ `wager-transactions-dlq.fifo`), o publicador da outbox em `wager-events.fifo`, o worker de referências pendentes, health checks, `GET /metrics` (Prometheus) e as migrations.
 
 ### Pré-requisitos
 
@@ -34,8 +34,9 @@ curl -i http://127.0.0.1:8080/health/live   # 200 {"status":"ok"}
 ```
 
 - `postgres` (PostgreSQL 17) e `api` são os serviços efetivamente exercitados pelos testes e pela API atual.
-- `keycloak` importa o realm `jungle` de `infra/keycloak/realm.json` (clientes, papéis e identidades de teste). `localstack` (SQS) é iniciado, mas a aplicação ainda não o utiliza.
+- `keycloak` importa o realm `jungle` de `infra/keycloak/realm.json` (clientes, papéis e identidades de teste). `localstack` cria as filas FIFO, o redrive (5 recebimentos) e as políticas em `infra/localstack/init/ready.d/10-sqs.sh`; a API só sobe depois que as filas existem.
 - A API lê `DATABASE_URL`, `OIDC_ISSUER_URL` e `OIDC_AUDIENCE` (obrigatórias), `OIDC_JWKS_URL` (padrão: certificados do realm sob o issuer) e `HTTP_ADDR` (padrão `:8080`). No Compose, todas são definidas em `compose.yaml`.
+- Variáveis de SQS e workers (todas com padrão, exceto `SQS_TRUSTED_PROVIDERS` e as credenciais AWS do `.env`): `AWS_REGION`, `AWS_ENDPOINT_URL`, `SQS_REQUESTS_QUEUE`, `SQS_DLQ_QUEUE`, `SQS_EVENTS_QUEUE`, `SQS_CONSUMER_NAME`, `SQS_RETRY_BASE_DELAY`, `SQS_RETRY_MAX_DELAY`, `REFERENCE_INITIAL_BACKOFF`, `REFERENCE_MAX_BACKOFF`, `REFERENCE_MAX_ATTEMPTS`, `REFERENCE_POLL_INTERVAL`, `OUTBOX_POLL_INTERVAL` (padrões em `internal/config`).
 - As migrations **não** são aplicadas automaticamente: use a seção a seguir.
 
 ### Migrations
@@ -73,6 +74,21 @@ curl -s -X POST localhost:8080/wagering/transactions -H "Authorization: Bearer $
   -d '{"providerId":"provider-a","externalTransactionId":"transaction-123","playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"<id da carteira>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}'
 ```
 
+### Mensagens SQS
+
+Envelope `WagerTransactionRequested` do enunciado, com `MessageGroupId` = `walletId` e `MessageDeduplicationId` = `messageId`. O `providerId` precisa estar em `SQS_TRUSTED_PROVIDERS` (ver a fronteira de confiança em `ARCHITECTURE.md`).
+
+```sh
+docker compose exec localstack awslocal sqs send-message \
+  --queue-url http://localhost:4566/000000000000/wager-transactions.fifo \
+  --message-group-id "<walletId>" --message-deduplication-id msg-123 \
+  --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-124","idempotencyKey":"provider-a:transaction-124","playerId":"<playerId>","walletId":"<walletId>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
+
+# eventos publicados pela outbox e mensagens recusadas
+docker compose exec localstack awslocal sqs receive-message --queue-url http://localhost:4566/000000000000/wager-events.fifo --max-number-of-messages 10
+docker compose exec localstack awslocal sqs receive-message --queue-url http://localhost:4566/000000000000/wager-transactions-dlq.fifo --message-attribute-names All
+```
+
 ### Testes
 
 Comandos do enunciado:
@@ -86,9 +102,9 @@ go vet ./...
 Testes unitários e de integração do schema, já executados e aprovados:
 
 - `go test ./...`, `go test -race ./...` e `go vet ./...` (unitários, sem dependências externas);
-- `go test -tags=integration -race ./...` (exige o PostgreSQL do Compose em `127.0.0.1:5432`, ou `TEST_DATABASE_URL`, e o Keycloak em `localhost:8180`, ou `TEST_KEYCLOAK_URL`; credenciais do banco e client secrets vêm do ambiente ou, na falta, do `.env` local, que os testes leem por conta própria (o `go test` não carrega `.env`); cada teste cria e remove um banco próprio, sem tocar no banco de desenvolvimento; os testes ponta a ponta HTTP ficam em `tests/`).
+- `go test -tags=integration -race ./...` (exige o PostgreSQL do Compose em `127.0.0.1:5432`, ou `TEST_DATABASE_URL`, e o Keycloak em `localhost:8180`, ou `TEST_KEYCLOAK_URL`; credenciais do banco, client secrets e credenciais AWS do LocalStack vêm do ambiente ou, na falta, do `.env` local, que os testes leem por conta própria (o `go test` não carrega `.env`); cada teste cria e remove um banco próprio, sem tocar no banco de desenvolvimento; os testes ponta a ponta (HTTP, SQS, outbox e workers, cada teste com filas próprias no LocalStack em `localhost:4566`) ficam em `tests/`).
 
-Ainda pendentes e não documentados como executáveis: mensageria SQS, três processos independentes e simulações de falha de processo.
+Ainda pendentes e não documentados como executáveis: três processos independentes. As falhas de processo (queda depois do commit e antes do ACK, envio sem confirmação na outbox) são simuladas dentro dos testes.
 
 ## Estado da entrega
 
@@ -99,11 +115,11 @@ Ainda pendentes e não documentados como executáveis: mensageria SQS, três pro
 | Schema financeiro PostgreSQL (migrations, constraints, triggers) | Implementado e testado (M1.1) |
 | WIN, LOSS, REFUND, ROLLBACK (sem HTTP) | Implementado e testado (M1.3) |
 | API HTTP com autenticação/autorização OIDC (Keycloak real) | Implementado e testado (M2) |
-| Consumer SQS, inbox e DLQ | Pendente |
-| Outbox: persistência | Implementado (M1.2); publicador pendente |
-| Referências pendentes: persistência, replay e passo transacional do worker | Implementado e testado (M1.3); laço automático pendente |
+| Consumer SQS FIFO, inbox transacional, DLQ e redrive | Implementado e testado com LocalStack (M3) |
+| Outbox: persistência e publicador FIFO com ordem por carteira | Implementado e testado com LocalStack (M3) |
+| Referências pendentes: persistência, replay e worker automático | Implementado e testado (M1.3, M3) |
 | Reconciliação (`POST /wallets/:walletId/reconciliation`), log JSON e métrica de divergência | Implementado e testado (M2.1) |
-| Testes distribuídos e recuperação | Pendente |
+| Recuperação (queda antes do ACK, reinício de workers); três processos independentes | Recuperação testada (M3); três processos pendente |
 
 ## Princípios de implementação
 

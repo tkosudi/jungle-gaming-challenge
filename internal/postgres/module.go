@@ -21,7 +21,7 @@ const (
 // Module fornece o *pgxpool.Pool e o usecase.Store. O pool nasce sem conexões; o ping acontece no
 // OnStart, para que um banco indisponível falhe o startup (e não a construção).
 var Module = fx.Module("postgres",
-	fx.Provide(providePool, provideStore),
+	fx.Provide(providePool, provideStore, asUsecaseStore),
 	fx.Invoke(registerHooks),
 )
 
@@ -29,9 +29,13 @@ func providePool(cfg config.Config) (*pgxpool.Pool, error) {
 	return newPool(cfg.DatabaseURL, defaultConnectTimeout)
 }
 
-func provideStore(pool *pgxpool.Pool) usecase.Store {
+func provideStore(pool *pgxpool.Pool) *Store {
 	return NewStore(pool, defaultLockTimeout)
 }
+
+// asUsecaseStore expõe o mesmo *Store como a interface usada pelos casos de uso; o publicador
+// da outbox usa o tipo concreto (PublishOutbox não é um caso de uso).
+func asUsecaseStore(s *Store) usecase.Store { return s }
 
 func registerHooks(lc fx.Lifecycle, pool *pgxpool.Pool) {
 	lc.Append(fx.Hook{

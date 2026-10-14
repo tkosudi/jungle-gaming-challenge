@@ -59,7 +59,7 @@ func TestReferenceConsistency_MigrationUpDownUp(t *testing.T) {
 	if fmt.Sprint(after) != fmt.Sprint(baseline) {
 		t.Fatalf("objects after down = %v, want %v", after, baseline)
 	}
-	if err := m.Up(); err != nil {
+	if err := m.Migrate(3); err != nil {
 		t.Fatalf("second up: %v", err)
 	}
 	if got := db.objectSnapshot(t); fmt.Sprint(got) != fmt.Sprint(withTrigger) {

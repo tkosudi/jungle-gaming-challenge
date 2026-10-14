@@ -7,13 +7,13 @@ Registro das decisões aprovadas, com o status real de implementação. O enunci
 | Área | Situação |
 | --- | --- |
 | Schema financeiro PostgreSQL (M1.1) | Implementado e coberto por testes de integração reais |
-| `Money`, `Wallet`, abertura de carteira e `BET` com idempotência (M1.2) | Implementado e testado; sem exposição HTTP |
-| Idempotência persistente e locking por carteira no caso de uso (M1.2) | Implementado e testado; entrada HTTP/SQS pendente |
-| `WIN`, `LOSS`, `REFUND`, `ROLLBACK`, referências pendentes e passo transacional do worker (M1.3) | Implementado e testado; sem HTTP e sem laço automático do worker (M3) |
-| Outbox (persistência) | Implementado (M1.2); sem publicador |
+| `Money`, `Wallet`, abertura de carteira e `BET` com idempotência (M1.2) | Implementado e testado |
+| Idempotência persistente e locking por carteira no caso de uso (M1.2) | Implementado e testado; compartilhada por HTTP e SQS (M3) |
+| `WIN`, `LOSS`, `REFUND`, `ROLLBACK`, referências pendentes e passo transacional do worker (M1.3) | Implementado e testado; laço automático no M3 |
+| Outbox: persistência (M1.2) e publicador SQS FIFO (M3) | Implementado e testado com LocalStack |
 | API HTTP, autenticação OIDC (Keycloak), composição Fx do núcleo e reconciliação (M2, M2.1) | Implementado e testado com PostgreSQL e Keycloak reais |
-| Inbox, laço do worker de referências com Fx, publicador SQS | Pendente |
-| SQS; métricas além da reconciliação | Pendente |
+| Consumidor SQS FIFO com inbox transacional, DLQ e workers Fx (M3) | Implementado e testado com PostgreSQL, Keycloak e LocalStack reais |
+| Três processos independentes; separação de papéis do banco (D8); IAM real do broker | Pendente |
 
 ## Migrations: golang-migrate (e não Atlas)
 
@@ -103,7 +103,7 @@ A garantia principal é `SELECT ... FOR UPDATE` na carteira, dentro da transaç�
 - A verificação do encadeamento lê o lançamento anterior no commit; em escritas concorrentes sem lock, `UNIQUE (wallet_id, wallet_version)` e o guard de versão derrubam uma delas, mas a serialização correta continua dependendo de `SELECT ... FOR UPDATE`.
 - Os triggers de ledger são `AFTER INSERT`; a imutabilidade do ledger e das transações terminais impede que um histórico confirmado deixe de bater, exceto por papel dono/superusuário (D8).
 - Códigos de falha (`failure_code`) são texto livre não vazio; o catálogo estável será definido com os casos de uso.
-- A inbox não existe ainda; a outbox existe a partir do M1.2 (D7).
+- A outbox existe a partir do M1.2 (D7) e a inbox a partir do M3 (migration 000004).
 
 ## Núcleo financeiro (M1.2): decisões
 
@@ -269,3 +269,101 @@ A API confia no claim `provider_id` porque ele é fixado pelo Keycloak por clien
 
 ### Segredos locais
 Nenhuma senha ou client secret fica em arquivo versionado. O `realm.json` usa placeholders `${PROVIDER_A_CLIENT_SECRET}` etc., que o Keycloak 26.8.0 resolve do ambiente ao importar o realm (validado: o secret do `.env` obtém token, o literal antigo e o placeholder cru recebem 401). O Compose passa esses valores ao Keycloak e exige (`${VAR:?}`) as senhas do PostgreSQL e do administrador e os client secrets. Os valores reais ficam no `.env` local, ignorado pelo Git; o `.env.example` só tem marcadores `change-me-*`. Os testes de integração leem as mesmas variáveis do ambiente ou, na ausência delas, do `.env` (`internal/testenv`, usado só por testes). Sem secret manager: para o desafio, `.env` local basta.
+
+## SQS, inbox, outbox e workers (M3)
+
+### Inbox transacional (migration 000004)
+- `inbox_messages`: chave `(consumer_name, message_id)`, `payload_hash` (32 bytes), `transaction_id`, `outcome` (estado da operação na conclusão: `PROCESSED`, `REJECTED` ou `PENDING_REFERENCE`), `received_at` (primeiro recebimento informado pelo SQS) e `completed_at`. Append-only por trigger.
+- `Service.ProcessMessage` reutiliza o mesmo fluxo de `Process` (lock da carteira, idempotência por chave e hash) **dentro da transação** que grava a inbox: efeitos financeiros, outbox e conclusão da mensagem saem no mesmo commit, ou nenhum. `Process` e seus testes não mudaram.
+- Ordem: consulta a inbox (mesmo hash: duplicata sem efeitos; outro hash: `ErrMessageConflict`); aplica a operação; insere a inbox com `ON CONFLICT DO NOTHING`. Se outra transação concluiu a mesma mensagem no meio-tempo: com o mesmo hash, a operação acima foi um replay; com outro, o rollback desfaz tudo e a mensagem vira conflito na próxima entrega.
+- Hash do conteúdo: SHA-256 de `{type, idempotencyKey, operation}`, em que `operation` é o mesmo JSON canônico do hash de idempotência (inclui o provedor). Ele compara o **conteúdo financeiro canônico**: `messageId` é a identidade e `occurredAt` é metadado de transporte, fora do hash. Um reenvio do mesmo `messageId` que só muda `occurredAt` é duplicata, não conflito.
+- Não há estado "recebido" confirmado: receber e concluir acontecem na mesma transação. Uma pendência (`PENDING_REFERENCE`) conclui a mensagem; o worker de referências continua daí (§6.5).
+
+### Consumidor (`internal/worker/consumer.go`)
+| Situação | Destino |
+| --- | --- |
+| Concluída (processada, rejeição de negócio, pendente, duplicata) | `DeleteMessage` **depois** do commit |
+| Contrato inválido, provedor fora da fronteira de confiança, mesmo `messageId` com outro conteúdo, conflito de idempotência | cópia para a DLQ com `failureReason` (`INVALID_MESSAGE`, `UNTRUSTED_PROVIDER`, `MESSAGE_CONFLICT`, `IDEMPOTENCY_CONFLICT`) e `DeleteMessage` |
+| Falha transitória ou inesperada (banco, lock, commit incerto) | fica na fila; `ChangeMessageVisibility` com `SQS_RETRY_BASE_DELAY·2^(recebimentos−1)` até `SQS_RETRY_MAX_DELAY`; após `maxReceiveCount` (5), o redrive leva à DLQ |
+
+- Queda depois do commit e antes do `DeleteMessage`: a reentrega encontra a inbox concluída e só apaga (testado).
+- Uma mensagem por recebimento (`MaxNumberOfMessages=1`). O visibility timeout (60s) conta desde o `ReceiveMessage`; num lote, as últimas mensagens esperariam o tratamento das anteriores e poderiam reaparecer no meio. Com uma só, o prazo cobre só o seu tratamento (no máximo 30s). Ordem FIFO: enquanto a mensagem está em voo, inclusive aguardando nova tentativa com visibility estendido, o SQS não entrega a seguinte do mesmo `MessageGroupId`. O teste de regressão cobre duas mensagens do grupo com a primeira falhando: a segunda só tem efeito depois de a primeira concluir ou ir para a DLQ. A versão anterior devolvia as seguintes do lote com `ChangeMessageVisibility 0`, e o LocalStack chegou a entregar a segunda antes da primeira.
+- Visibility timeout da fila: 60s; o tratamento de uma mensagem tem prazo de 30s.
+- Contrato do produtor: `MessageGroupId` = `walletId` (ordem por carteira) e `MessageDeduplicationId` = `messageId`. Sem esse agrupamento a correção continua garantida pelo PostgreSQL (o teste 100/80/80 usa grupos distintos de propósito), mas a ordem de chegada não.
+- Shutdown: o laço para de buscar trabalho, mas o `ReceiveMessage` em curso **não é cancelado**. Abandonar um long polling deixa o broker entregar mensagens a uma requisição que ninguém lê; elas ficariam presas até o visibility timeout (defeito observado e corrigido nos testes). A espera é de no máximo 5s. A mensagem em tratamento termina; uma recebida durante o shutdown volta à fila sem tratamento.
+
+### Fronteira de confiança da entrada SQS
+- O SQS não informa, por mensagem, qual identidade IAM a enviou. `data.providerId` é, portanto, uma declaração do produtor, não uma identidade autenticada como o `provider_id` do token HTTP.
+- Modelo adotado: a fila de entrada tem um único produtor confiável, o gateway dos provedores, que autentica cada provedor antes de publicar em nome dele. A confiança vem de três controles:
+  1. as credenciais e a política da fila (`SendMessage` só para o papel do gateway; consumo só para a API), provisionadas em `infra/localstack/init/ready.d/10-sqs.sh`;
+  2. a lista `SQS_TRUSTED_PROVIDERS`, os provedores que esse produtor pode representar: qualquer outro vai para a DLQ com `UNTRUSTED_PROVIDER`;
+  3. a validação de domínio, idêntica à do HTTP.
+- Um provedor com acesso direto à fila conseguiria se passar por outro da lista. Por isso a política não pode conceder `SendMessage` a provedores. Para vincular cada mensagem a um provedor específico seria preciso uma fila por provedor (`aws:SourceArn`/principal por fila) ou mensagens assinadas; isso fica como evolução.
+- **LocalStack:** o Community grava as políticas, mas não aplica IAM; as credenciais (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, no `.env`) não autenticam nada. Localmente, a fronteira efetiva é a lista de provedores e a rede do Compose. Nenhum token ou segredo está no código, nos testes ou no Compose.
+
+### Publicador da outbox (`postgres.Store.PublishOutbox` + `internal/worker/publisher.go`)
+- Cada lote, numa transação: seleciona até 10 eventos **cabeça de grupo** (`FOR UPDATE SKIP LOCKED`, com `NOT EXISTS` de predecessor não publicado do mesmo `message_group_id`); envia cada um com `MessageGroupId` = carteira (ou a transação, nas rejeições sem carteira), `MessageDeduplicationId` = `eventId`, corpo = payload imutável; só depois da resposta do SQS marca `published_at`. Uma falha de envio agenda nova tentativa (1s·2^n até 60s) e bloqueia apenas aquela carteira.
+- Por que o predecessor: com `SKIP LOCKED` sozinho, um segundo publicador pegaria o evento seguinte da carteira enquanto o anterior ainda está em envio, e o faria sair antes. Grupos diferentes avançam em paralelo; não há lock global. Índice `outbox_events_unpublished_by_group` (000004).
+- **At-least-once:** se a confirmação no PostgreSQL falhar depois de o SQS aceitar (erro, queda, COMMIT perdido), o lote volta a pendente e é reenviado com o mesmo `eventId`. O SQS FIFO descarta repetições do mesmo `MessageDeduplicationId` por 5 minutos; depois disso, ou noutro broker, o consumidor de eventos deve deduplicar por `eventId`. Não há exactly-once.
+- A transação do lote fica aberta durante os envios (prazo de 30s): é o lock de linha que impede dois publicadores no mesmo evento, sem colunas de lease.
+- Fila `wager-events.fifo`; atributos `eventType` e `eventId`. Os consumidores do evento estão fora do escopo.
+
+### Worker de referências pendentes
+Laço que chama `Service.ResolveNextPendingReference` (M1.3) até não haver pendência vencida e então espera `REFERENCE_POLL_INTERVAL`. Tentativas, atraso e expiração continuam no PostgreSQL (`REFERENCE_*` configuram a política); várias instâncias convivem pelo `SKIP LOCKED` da carteira e retomam depois de um reinício.
+
+### Lifecycle, saúde e observabilidade
+- `worker.Module`: cada laço resolve suas filas no `OnStart` (fila ausente falha o startup) e roda em goroutine; no `OnStop`, cancela a busca de trabalho e espera a unidade em andamento terminar (transação com contexto próprio, sem cancelamento no meio). Ordem: start PostgreSQL → HTTP → workers; stop na ordem inversa, de modo que o pool só fecha depois dos workers. `docker compose stop api` (SIGTERM) termina com código 0 em cerca de 6s.
+- Prazo de parada: os hooks param um depois do outro, então o `fx.StopTimeout` (120s, `internal/app`) cobre a soma dos piores casos:
+  - consumidor: long polling 5s + chamada 5s + mensagem 30s + delete/visibility 5s = 45s;
+  - publicador: lote 30s + leitura do atraso 5s = 35s;
+  - referências: passo de 15s;
+  - HTTP: requisições em andamento, 10s;
+  - fechamento do pool.
+
+  O total é 106s (`worker.MaxStopDuration` + `httpapi.MaxShutdownDuration`, verificado em teste). O padrão do Fx (15s) cortaria unidades de trabalho no meio. O `stop_grace_period` do Compose é 130s, acima do prazo do Fx, para o SIGKILL não interromper o shutdown. Transação cortada pelo prazo é desfeita, e a mensagem volta à fila.
+- A partida mantém o prazo padrão do Fx (15s).
+- `/health/ready`: PostgreSQL (`Ping`) e SQS (`GetQueueUrl` da fila de entrada). O Keycloak não entra: sua indisponibilidade afeta só a autenticação (503 nas rotas protegidas), não a liveness nem a readiness.
+- Métricas novas:
+  - `wagering_operations_total{source,status}`;
+  - `wagering_duplicates_total{kind=http|sqs|sqs_inbox}`;
+  - `sqs_messages_total{outcome=completed|retried|dead_lettered|released}`;
+  - `sqs_dead_lettered_total{reason}`;
+  - `outbox_events_published_total`, `outbox_publish_failures_total`;
+  - `outbox_oldest_pending_age_seconds` (atraso), `outbox_pending_events`;
+  - `pending_reference_steps_total{status}`, `worker_errors_total{worker}`.
+- Logs JSON com `messageId`, `sqsMessageId`, `providerId`, `walletId`, `transactionId`, `eventId`; nunca o payload completo, tokens ou segredos.
+
+### Evidências do M3
+- **PostgreSQL real:**
+  - inbox concluída no mesmo commit;
+  - duplicata, conflito e replay de operação vinda do HTTP;
+  - 50 mensagens equivalentes (mesmo id ou ids distintos) em 3 instâncias geram 1 débito;
+  - conflito concorrente pelo mesmo `messageId`;
+  - falhas imediata e diferida sem resíduo;
+  - inbox append-only; `up → down → up` da 000004.
+- **Publicador (PostgreSQL real):**
+  - ordem por grupo;
+  - falha de envio bloqueia só o grupo e é reprocessada;
+  - falha entre envio e confirmação republica o mesmo evento e payload;
+  - dois publicadores sem perda nem duplicata.
+- **Ponta a ponta (Fx completo, PostgreSQL, Keycloak, LocalStack):**
+  - 50 reentregas do mesmo `messageId`, HTTP depois de SQS, outra mensagem e 50 mensagens distintas: um efeito por operação;
+  - 100/80/80 em 3 rodadas;
+  - falha injetada sem efeitos e reentrega aplicada uma vez;
+  - queda depois do commit e antes do ACK;
+  - DLQ com os quatro motivos;
+  - falha transitória persistente chegando à DLQ pelo redrive;
+  - dois publicadores entregando todos os eventos na ordem da carteira;
+  - recuperação depois de envio sem confirmação;
+  - REFUND antes da BET resolvido automaticamente, e ROLLBACK expirado;
+  - parada e reinício sem mensagem presa;
+  - readiness com SQS.
+- **Mutações verificadas:** sem o predecessor, marcar publicado antes do envio, e apagar a mensagem antes do commit fazem testes falharem.
+- **Smoke test no Compose:** 3 reentregas e 1 mensagem inválida; 1 débito, fila vazia, DLQ com `INVALID_MESSAGE`, eventos publicados na ordem, métricas e logs JSON conferidos.
+
+### Limites do M3
+- As "instâncias" dos testes são apps Fx com pools e clientes próprios no mesmo processo; três processos independentes continuam não executados.
+- IAM e políticas do broker não são aplicados pelo LocalStack Community; o vínculo produtor → provedor depende do papel de gateway descrito acima.
+- O consumidor trata uma mensagem por vez; a vazão vem de grupos distintos e de mais instâncias.
+- A DLQ não tem reprocessamento automático: é destino de inspeção, com o motivo no atributo `failureReason` (ou sem ele, quando veio pelo redrive).
+- O envio manual à DLQ (`SendMessage` na DLQ e depois `DeleteMessage` na entrada) **não é atômico**. Uma queda entre os dois, ou falha do `DeleteMessage`, faz a mensagem ser recusada de novo e copiada outra vez. O `MessageDeduplicationId` da cópia é o ID SQS original, então o SQS FIFO descarta a repetição em 5 minutos; depois disso a DLQ pode ter duplicatas. Limitação aceita: a DLQ não aplica efeitos financeiros.

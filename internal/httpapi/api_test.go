@@ -82,6 +82,10 @@ type pinger struct{ err error }
 
 func (p pinger) Ping(context.Context) error { return p.err }
 
+func readiness(db pinger) []ReadinessCheck {
+	return []ReadinessCheck{{Name: "postgres", Check: db.Ping}, {Name: "sqs", Check: func(context.Context) error { return nil }}}
+}
+
 func newTestApp(t *testing.T, p *testIDP) *fiber.App {
 	t.Helper()
 	jwks := "http://127.0.0.1:1/unreachable"
@@ -89,7 +93,7 @@ func newTestApp(t *testing.T, p *testIDP) *fiber.App {
 		jwks = p.server.URL
 	}
 	verifier := auth.NewVerifier(config.OIDC{IssuerURL: testIssuer, JWKSURL: jwks, Audience: testAudience})
-	return NewApp(nil, verifier, pinger{})
+	return NewApp(nil, verifier, readiness(pinger{}))
 }
 
 type response struct {
@@ -146,13 +150,17 @@ const validOperation = `{"providerId":"provider-a","externalTransactionId":"tx-1
 	"walletId":"0192f291-27dd-7d3f-8071-5f8685deef37","roundId":"r-1","gameId":"g-1","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}`
 
 func TestHealthReady(t *testing.T) {
-	ok := do(t, NewApp(nil, nil, pinger{}), http.MethodGet, "/health/ready", "", "")
+	ok := do(t, NewApp(nil, nil, readiness(pinger{})), http.MethodGet, "/health/ready", "", "")
 	if ok.status != http.StatusOK || ok.body["status"] != "ok" {
 		t.Fatalf("ready = %d %v", ok.status, ok.body)
 	}
-	down := do(t, NewApp(nil, nil, pinger{err: errors.New("down")}), http.MethodGet, "/health/ready", "", "")
-	if down.status != http.StatusServiceUnavailable || down.body["status"] != "unavailable" {
+	down := do(t, NewApp(nil, nil, readiness(pinger{err: errors.New("down")})), http.MethodGet, "/health/ready", "", "")
+	checks, _ := down.body["checks"].(map[string]any)
+	if down.status != http.StatusServiceUnavailable || down.body["status"] != "unavailable" || checks["postgres"] != "unavailable" || checks["sqs"] != "ok" {
 		t.Fatalf("ready with database down = %d %v", down.status, down.body)
+	}
+	if checks, _ := ok.body["checks"].(map[string]any); checks["postgres"] != "ok" || checks["sqs"] != "ok" {
+		t.Fatalf("ready checks = %v", ok.body)
 	}
 }
 

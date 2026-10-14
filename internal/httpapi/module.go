@@ -7,7 +7,7 @@ import (
 )
 
 // Module registra a aplicação Fiber e o servidor HTTP no ciclo de vida do Fx. NewApp recebe
-// o Service, o verificador de tokens e o Pinger do banco, fornecidos pela composição (app).
+// o Service, o verificador de tokens e as verificações de readiness, fornecidos pela composição (app).
 var Module = fx.Module("httpapi",
 	fx.Provide(NewApp, NewServer),
 	fx.Invoke(registerHooks),

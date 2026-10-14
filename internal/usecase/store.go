@@ -28,6 +28,9 @@ var (
 	// ErrUnavailable: o banco não pôde ser alcançado ou encerrou a conexão antes do COMMIT;
 	// nada foi confirmado e a requisição pode ser repetida.
 	ErrUnavailable = errors.New("usecase: database unavailable")
+	// ErrMessageConflict: o mesmo messageId já foi concluído com outro conteúdo. É permanente:
+	// reentregar não muda o resultado.
+	ErrMessageConflict = errors.New("usecase: message id reused with different content")
 	// ErrTransactionNotFound: a transação não existe ou pertence a outro provedor.
 	ErrTransactionNotFound = errors.New("usecase: transaction not found")
 )
@@ -81,6 +84,11 @@ type Tx interface {
 	// provedor informado; as demais são ErrTransactionNotFound.
 	GetProviderTransaction(ctx context.Context, providerID string, id uuid.UUID) (Transaction, error)
 	GetProviderTransactionByExternalID(ctx context.Context, providerID, externalID string) (Transaction, error)
+	// FindInboxMessage lê a conclusão de uma mensagem; found=false se ainda não foi tratada.
+	FindInboxMessage(ctx context.Context, consumerName, messageID string) (msg StoredInboxMessage, found bool, err error)
+	// InsertInboxMessage registra a conclusão; inserted=false se outra transação já a registrou.
+	InsertInboxMessage(ctx context.Context, r InboxRecord) (inserted bool, err error)
+
 	// ReconciliationSnapshot lê, num único snapshot, o saldo armazenado e o reconstruído pelo ledger;
 	// ErrWalletNotFound se a carteira não existir.
 	ReconciliationSnapshot(ctx context.Context, walletID uuid.UUID) (ReconciliationSnapshot, error)
@@ -193,4 +201,22 @@ type ReconciliationSnapshot struct {
 	// corrompido.
 	LedgerBalance domain.Money
 	Entries       int64
+}
+
+// StoredInboxMessage é a conclusão já registrada de uma mensagem.
+type StoredInboxMessage struct {
+	PayloadHash   []byte
+	TransactionID uuid.UUID
+	Outcome       domain.Status
+}
+
+// InboxRecord é a conclusão de uma mensagem, gravada junto com os efeitos dela.
+type InboxRecord struct {
+	ConsumerName  string
+	MessageID     string
+	PayloadHash   [32]byte
+	TransactionID uuid.UUID
+	Outcome       domain.Status
+	ReceivedAt    time.Time
+	CompletedAt   time.Time
 }

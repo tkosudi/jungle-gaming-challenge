@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tkosudi/jungle-gaming-challenge/internal/domain"
+	"github.com/tkosudi/jungle-gaming-challenge/internal/metrics"
 	"github.com/tkosudi/jungle-gaming-challenge/internal/usecase"
 )
 
@@ -71,6 +72,11 @@ func (a *api) submitOperation(c fiber.Ctx) error {
 	res, err := a.service.Process(ctx, p.ProviderID, op)
 	if err != nil {
 		return serviceError(c, err)
+	}
+	if res.Replay {
+		metrics.Duplicates.WithLabelValues("http").Inc()
+	} else {
+		metrics.Operations.WithLabelValues("http", string(res.Status)).Inc()
 	}
 	status := fiber.StatusOK
 	switch res.Status {

@@ -112,24 +112,63 @@ func newDatabase(t *testing.T) string {
 	return dbURL
 }
 
-// startInstance sobe uma instância completa (Fx) com pool próprio e devolve sua URL base.
-func startInstance(t *testing.T, dbURL string) string {
+// environment é o que as instâncias de um teste compartilham: banco descartável e filas SQS
+// exclusivas no LocalStack.
+type environment struct {
+	dbURL  string
+	queues testenv.Queues
+}
+
+func newEnvironment(t *testing.T) environment {
+	t.Helper()
+	return environment{dbURL: newDatabase(t), queues: testenv.SQSQueues(t, 5)}
+}
+
+// instanceConfig é a configuração de uma instância de teste: workers com intervalos curtos.
+func (e environment) instanceConfig() config.Config {
+	return config.Config{
+		HTTPAddr: "127.0.0.1:0", DatabaseURL: e.dbURL, OIDC: oidc, SQS: e.queues.Config,
+		Workers: config.Workers{
+			ReferenceInitialBackoff: 100 * time.Millisecond, ReferenceMaxBackoff: time.Second, ReferenceMaxAttempts: 10,
+			ReferencePollInterval: 100 * time.Millisecond, OutboxPollInterval: 100 * time.Millisecond,
+		},
+	}
+}
+
+// startInstance sobe uma instância completa (Fx: HTTP, consumidor, publicador e worker de
+// referências) com pool próprio e devolve sua URL base. Para no fim do teste.
+func startInstance(t *testing.T, e environment) string {
+	t.Helper()
+	base, stop := startConfigured(t, e.instanceConfig())
+	t.Cleanup(func() {
+		if err := stop(); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	})
+	return base
+}
+
+// startConfigured sobe a instância e devolve a função que a para (com prazo de shutdown).
+func startConfigured(t *testing.T, cfg config.Config) (string, func() error) {
 	t.Helper()
 	var srv *httpapi.Server
-	a := app.New(config.Config{HTTPAddr: "127.0.0.1:0", DatabaseURL: dbURL, OIDC: oidc}, fx.NopLogger, fx.Populate(&srv))
+	a := app.New(cfg, fx.NopLogger, fx.Populate(&srv))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := a.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := a.Stop(ctx); err != nil {
-			t.Errorf("stop: %v", err)
-		}
-	})
-	return "http://" + srv.Addr().String()
+	var once sync.Once
+	var stopErr error
+	stop := func() error {
+		once.Do(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			stopErr = a.Stop(ctx)
+		})
+		return stopErr
+	}
+	return "http://" + srv.Addr().String(), stop
 }
 
 var (
@@ -266,7 +305,7 @@ func submit(t *testing.T, base, client string, op operation, key string) reply {
 }
 
 func TestHTTP_WalletAndWageringFlow(t *testing.T) {
-	base := startInstance(t, newDatabase(t))
+	base := startInstance(t, newEnvironment(t))
 	internal := token(t, "internal-service")
 	wallet, player := openWallet(t, base, "100.00")
 
@@ -343,7 +382,7 @@ func TestHTTP_WalletAndWageringFlow(t *testing.T) {
 }
 
 func TestHTTP_ProviderIdentityComesOnlyFromTheToken(t *testing.T) {
-	base := startInstance(t, newDatabase(t))
+	base := startInstance(t, newEnvironment(t))
 	wallet, player := openWallet(t, base, "100.00")
 
 	spoofed := newOperation("provider-b", wallet, player, "BET", "bet-1", "10.00", "")
@@ -359,7 +398,7 @@ func TestHTTP_ProviderIdentityComesOnlyFromTheToken(t *testing.T) {
 }
 
 func TestHTTP_AuthenticationWithRealKeycloak(t *testing.T) {
-	base := startInstance(t, newDatabase(t))
+	base := startInstance(t, newEnvironment(t))
 	probe := base + "/wagering/transactions/" + uuid.NewString() // 404 prova que a autenticação passou
 
 	expect(t, call(t, http.MethodGet, probe, token(t, "provider-a"), nil), http.StatusNotFound, "error.code", "TRANSACTION_NOT_FOUND")
@@ -409,8 +448,8 @@ func TestHTTP_AuthenticationWithRealKeycloak(t *testing.T) {
 }
 
 func TestHTTP_ConcurrencyAcrossIndependentInstances(t *testing.T) {
-	dbURL := newDatabase(t)
-	instances := []string{startInstance(t, dbURL), startInstance(t, dbURL), startInstance(t, dbURL)}
+	env := newEnvironment(t)
+	instances := []string{startInstance(t, env), startInstance(t, env), startInstance(t, env)}
 	wallet, player := openWallet(t, instances[0], "100.00")
 	token(t, "provider-a")
 
@@ -464,7 +503,7 @@ func TestHTTP_ConcurrencyAcrossIndependentInstances(t *testing.T) {
 }
 
 func TestHTTP_Reconciliation(t *testing.T) {
-	base := startInstance(t, newDatabase(t))
+	base := startInstance(t, newEnvironment(t))
 	internal := token(t, "internal-service")
 	wallet, player := openWallet(t, base, "1000.00")
 	submit(t, base, "provider-a", newOperation("provider-a", wallet, player, "BET", "bet-1", "25.00", ""), "provider-a:bet-1")

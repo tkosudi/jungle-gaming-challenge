@@ -23,6 +23,12 @@ import (
 
 func testDatabaseURL() string { return testenv.DatabaseURL() }
 
+// testWorkers usa intervalos curtos; a política de referências é a padrão.
+var testWorkers = config.Workers{
+	ReferenceInitialBackoff: time.Second, ReferenceMaxBackoff: time.Minute, ReferenceMaxAttempts: 10,
+	ReferencePollInterval: 100 * time.Millisecond, OutboxPollInterval: 100 * time.Millisecond,
+}
+
 // testOIDC aponta para o Keycloak do Compose; o JWKS só é buscado quando um token é verificado.
 var testOIDC = config.OIDC{
 	IssuerURL: "http://localhost:8180/realms/jungle",
@@ -51,7 +57,7 @@ func newApp(t *testing.T, cfg config.Config) (*fx.App, *httpapi.Server, *pgxpool
 }
 
 func TestApp_StartServesAndStopsReleasingResources(t *testing.T) {
-	app, srv, pool := newApp(t, config.Config{HTTPAddr: "127.0.0.1:0", DatabaseURL: testDatabaseURL(), OIDC: testOIDC})
+	app, srv, pool := newApp(t, config.Config{HTTPAddr: "127.0.0.1:0", DatabaseURL: testDatabaseURL(), OIDC: testOIDC, SQS: testenv.SQSQueues(t, 5).Config, Workers: testWorkers})
 
 	if err := app.Start(ctxTimeout(t, 10*time.Second)); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -97,7 +103,7 @@ func TestApp_StartFailsWhenHTTPPortBusy_ReleasesPool(t *testing.T) {
 	}
 	defer busy.Close()
 
-	app, _, pool := newApp(t, config.Config{HTTPAddr: busy.Addr().String(), DatabaseURL: testDatabaseURL(), OIDC: testOIDC})
+	app, _, pool := newApp(t, config.Config{HTTPAddr: busy.Addr().String(), DatabaseURL: testDatabaseURL(), OIDC: testOIDC, SQS: testenv.SQSQueues(t, 5).Config, Workers: testWorkers})
 
 	err = app.Start(ctxTimeout(t, 10*time.Second))
 	if err == nil {
@@ -125,6 +131,8 @@ func TestApp_StartFailsWhenDatabaseUnavailable(t *testing.T) {
 		HTTPAddr:    "127.0.0.1:0",
 		DatabaseURL: fmt.Sprintf("postgres://jungle:x@%s/jungle?sslmode=disable", dead),
 		OIDC:        testOIDC,
+		SQS:         testenv.SQSQueues(t, 5).Config,
+		Workers:     testWorkers,
 	})
 
 	begin := time.Now()
