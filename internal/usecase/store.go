@@ -25,12 +25,19 @@ var (
 	// confirmada. Reenviar a mesma requisição (mesma chave) é seguro: se o commit ocorreu, a
 	// resposta é o replay do resultado original; se não, a operação é aplicada uma única vez.
 	ErrCommitUnknown = errors.New("usecase: commit outcome unknown")
+	// ErrUnavailable: o banco não pôde ser alcançado ou encerrou a conexão antes do COMMIT;
+	// nada foi confirmado e a requisição pode ser repetida.
+	ErrUnavailable = errors.New("usecase: database unavailable")
+	// ErrTransactionNotFound: a transação não existe ou pertence a outro provedor.
+	ErrTransactionNotFound = errors.New("usecase: transaction not found")
 )
 
 // Store abre uma transação PostgreSQL READ COMMITTED, executa fn e confirma. Qualquer erro de
 // fn desfaz tudo; fn executa no máximo uma vez (sem retry implícito).
 type Store interface {
 	InTx(ctx context.Context, fn func(Tx) error) error
+	// InReadOnlyTx é igual a InTx, mas o banco recusa qualquer escrita (READ ONLY).
+	InReadOnlyTx(ctx context.Context, fn func(Tx) error) error
 }
 
 // Tx é o conjunto de operações de persistência de uma transação financeira.
@@ -65,6 +72,18 @@ type Tx interface {
 
 	InsertLedgerEntry(ctx context.Context, e LedgerEntry) error
 	InsertOutboxEvent(ctx context.Context, e OutboxEvent) error
+
+	// GetWallet lê a carteira sem lock; ErrWalletNotFound se não existir.
+	GetWallet(ctx context.Context, id uuid.UUID) (domain.Wallet, error)
+	// ListLedgerEntries devolve até limit lançamentos com versão maior que afterVersion, em ordem.
+	ListLedgerEntries(ctx context.Context, walletID uuid.UUID, afterVersion int64, limit int) ([]LedgerEntry, error)
+	// GetProviderTransaction e GetProviderTransactionByExternalID só enxergam transações do
+	// provedor informado; as demais são ErrTransactionNotFound.
+	GetProviderTransaction(ctx context.Context, providerID string, id uuid.UUID) (Transaction, error)
+	GetProviderTransactionByExternalID(ctx context.Context, providerID, externalID string) (Transaction, error)
+	// ReconciliationSnapshot lê, num único snapshot, o saldo armazenado e o reconstruído pelo ledger;
+	// ErrWalletNotFound se a carteira não existir.
+	ReconciliationSnapshot(ctx context.Context, walletID uuid.UUID) (ReconciliationSnapshot, error)
 }
 
 // OperationRecord é a operação a persistir, já decidida.
@@ -143,4 +162,35 @@ type OutboxEvent struct {
 	TransactionID  uuid.UUID
 	Payload        []byte
 	OccurredAt     time.Time
+}
+
+// Transaction é a transação externa como persistida, para consulta.
+type Transaction struct {
+	ID                             uuid.UUID
+	Kind                           string
+	Status                         domain.Status
+	ProviderID                     string
+	ExternalTransactionID          string
+	PlayerID                       uuid.UUID
+	WalletID                       *uuid.UUID
+	RoundID                        string
+	GameID                         string
+	Money                          domain.Money
+	ReferenceExternalTransactionID string
+	ReferenceTransactionID         *uuid.UUID
+	FailureCode                    string
+	ResultBalance                  *domain.Money
+	ReferenceAttempts              int
+	NextAttemptAt                  *time.Time
+	CreatedAt                      time.Time
+	UpdatedAt                      time.Time
+}
+
+// ReconciliationSnapshot reúne o saldo armazenado e o reconstruído pelo ledger de uma carteira.
+type ReconciliationSnapshot struct {
+	StoredBalance domain.Money
+	// LedgerBalance é créditos - débitos, inclusive a OPENING; negativo só se o ledger estiver
+	// corrompido.
+	LedgerBalance domain.Money
+	Entries       int64
 }

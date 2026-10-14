@@ -12,6 +12,38 @@ import (
 	"github.com/google/uuid"
 )
 
+const getReconciliationSnapshot = `-- name: GetReconciliationSnapshot :one
+SELECT w.currency, w.balance,
+       COALESCE(SUM(CASE l.direction WHEN 'CREDIT' THEN l.amount ELSE -l.amount END), 0)::bigint AS ledger_balance,
+       count(l.id) AS entries
+FROM wallets w
+LEFT JOIN wallet_ledger_entries l ON l.wallet_id = w.id
+WHERE w.id = $1
+GROUP BY w.id
+`
+
+type GetReconciliationSnapshotRow struct {
+	Currency      string
+	Balance       int64
+	LedgerBalance int64
+	Entries       int64
+}
+
+// Um único statement: saldo armazenado e saldo reconstruído pelo ledger vêm do mesmo snapshot,
+// sem lock e sem bloquear escritores. SUM(bigint) é numeric (exato): os totais históricos de
+// cada direção podem passar de int64, então só o líquido (créditos - débitos) vira bigint.
+func (q *Queries) GetReconciliationSnapshot(ctx context.Context, id uuid.UUID) (GetReconciliationSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, getReconciliationSnapshot, id)
+	var i GetReconciliationSnapshotRow
+	err := row.Scan(
+		&i.Currency,
+		&i.Balance,
+		&i.LedgerBalance,
+		&i.Entries,
+	)
+	return i, err
+}
+
 const insertLedgerEntry = `-- name: InsertLedgerEntry :exec
 INSERT INTO wallet_ledger_entries (
     id, wallet_id, transaction_id, direction, amount, balance_before, balance_after, wallet_version, created_at)
@@ -43,4 +75,59 @@ func (q *Queries) InsertLedgerEntry(ctx context.Context, arg InsertLedgerEntryPa
 		arg.CreatedAt,
 	)
 	return err
+}
+
+const listLedgerEntries = `-- name: ListLedgerEntries :many
+SELECT id, transaction_id, direction, amount, balance_before, balance_after, wallet_version, created_at
+FROM wallet_ledger_entries
+WHERE wallet_id = $1 AND wallet_version > $2
+ORDER BY wallet_version
+LIMIT $3
+`
+
+type ListLedgerEntriesParams struct {
+	WalletID      uuid.UUID
+	WalletVersion int64
+	Limit         int32
+}
+
+type ListLedgerEntriesRow struct {
+	ID            uuid.UUID
+	TransactionID uuid.UUID
+	Direction     string
+	Amount        int64
+	BalanceBefore int64
+	BalanceAfter  int64
+	WalletVersion int64
+	CreatedAt     time.Time
+}
+
+// Ordem estável pela versão da carteira (única por carteira); o cursor é a última versão lida.
+func (q *Queries) ListLedgerEntries(ctx context.Context, arg ListLedgerEntriesParams) ([]ListLedgerEntriesRow, error) {
+	rows, err := q.db.Query(ctx, listLedgerEntries, arg.WalletID, arg.WalletVersion, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLedgerEntriesRow
+	for rows.Next() {
+		var i ListLedgerEntriesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TransactionID,
+			&i.Direction,
+			&i.Amount,
+			&i.BalanceBefore,
+			&i.BalanceAfter,
+			&i.WalletVersion,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

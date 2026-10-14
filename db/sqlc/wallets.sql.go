@@ -12,6 +12,33 @@ import (
 	"github.com/google/uuid"
 )
 
+const getWallet = `-- name: GetWallet :one
+SELECT id, player_id, currency, balance, version
+FROM wallets
+WHERE id = $1
+`
+
+type GetWalletRow struct {
+	ID       uuid.UUID
+	PlayerID uuid.UUID
+	Currency string
+	Balance  int64
+	Version  int64
+}
+
+func (q *Queries) GetWallet(ctx context.Context, id uuid.UUID) (GetWalletRow, error) {
+	row := q.db.QueryRow(ctx, getWallet, id)
+	var i GetWalletRow
+	err := row.Scan(
+		&i.ID,
+		&i.PlayerID,
+		&i.Currency,
+		&i.Balance,
+		&i.Version,
+	)
+	return i, err
+}
+
 const getWalletByPlayerAndCurrency = `-- name: GetWalletByPlayerAndCurrency :one
 SELECT id, player_id, currency, balance, version
 FROM wallets

@@ -22,3 +22,8 @@ FOR UPDATE;
 UPDATE wallets
 SET balance = $2, version = $3, updated_at = $4
 WHERE id = $1;
+
+-- name: GetWallet :one
+SELECT id, player_id, currency, balance, version
+FROM wallets
+WHERE id = $1;

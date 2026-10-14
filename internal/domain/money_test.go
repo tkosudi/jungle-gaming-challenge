@@ -118,8 +118,9 @@ func TestMoney_AddSub(t *testing.T) {
 	if err != nil || diff.Amount() != "59.50" {
 		t.Fatalf("Sub = %v, %v", diff, err)
 	}
-	if _, err := b.Sub(a); !errors.Is(err, ErrNegativeAmount) {
-		t.Errorf("Sub below zero error = %v, want ErrNegativeAmount", err)
+	// Diferenças internas podem ser negativas (reconciliação); entradas externas e saldos não.
+	if neg, err := b.Sub(a); err != nil || neg.Amount() != "-59.50" || !neg.IsNegative() {
+		t.Errorf("Sub below zero = %v, %v; want -59.50", neg, err)
 	}
 	max, _ := MoneyFromCents(math.MaxInt64, "BRL")
 	cent, _ := NewMoney("0.01", "BRL")
@@ -169,5 +170,73 @@ func TestMoneyFromCents(t *testing.T) {
 	m, err := MoneyFromCents(97500, "BRL")
 	if err != nil || m.Amount() != "975.00" {
 		t.Errorf("MoneyFromCents(97500) = %v, %v", m, err)
+	}
+}
+
+func TestMoney_SignedArithmetic(t *testing.T) {
+	brl := func(cents int64) Money { return Money{cents: cents, currency: "BRL"} }
+	tests := []struct {
+		name string
+		got  func() (Money, error)
+		want string
+		err  error
+	}{
+		{"negative plus positive", func() (Money, error) { return brl(-500).Add(brl(200)) }, "-3.00", nil},
+		{"negative minus negative", func() (Money, error) { return brl(-500).Sub(brl(-200)) }, "-3.00", nil},
+		{"sub of a negative adds", func() (Money, error) { return brl(100).Sub(brl(-250)) }, "3.50", nil},
+		{"negation", func() (Money, error) { return brl(1999).Neg() }, "-19.99", nil},
+		{"negation of a negative", func() (Money, error) { return brl(-5).Neg() }, "0.05", nil},
+		{"negation of zero", func() (Money, error) { return brl(0).Neg() }, "0.00", nil},
+		{"smallest representable", func() (Money, error) { return brl(-math.MaxInt64).Sub(brl(1)) }, "-92233720368547758.08", nil},
+		{"add overflow below", func() (Money, error) { return brl(math.MinInt64).Add(brl(-1)) }, "", ErrAmountOverflow},
+		{"sub overflow above", func() (Money, error) { return brl(math.MaxInt64).Sub(brl(-1)) }, "", ErrAmountOverflow},
+		{"sub overflow below", func() (Money, error) { return brl(math.MinInt64 + 1).Sub(brl(2)) }, "", ErrAmountOverflow},
+		{"negation overflow", func() (Money, error) { return brl(math.MinInt64).Neg() }, "", ErrAmountOverflow},
+		{"uninitialized negation", func() (Money, error) { return Money{}.Neg() }, "", ErrInvalidCurrency},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.got()
+			if !errors.Is(err, tc.err) || (tc.err == nil && err != nil) {
+				t.Fatalf("error = %v, want %v", err, tc.err)
+			}
+			if tc.err == nil && got.Amount() != tc.want {
+				t.Fatalf("Amount() = %s, want %s", got.Amount(), tc.want)
+			}
+		})
+	}
+	if brl(-1).IsPositive() || brl(-1).IsZero() || !brl(-1).IsNegative() || brl(0).IsNegative() {
+		t.Error("sign predicates are wrong for -0.01 / 0.00")
+	}
+}
+
+// Valores negativos só nascem de aritmética interna: a fronteira externa e a reidratação
+// de valores persistidos continuam recusando-os, e a carteira nunca fica negativa.
+func TestMoney_NegativeValuesNeverEnterFromOutsideOrIntoAWallet(t *testing.T) {
+	if _, err := NewMoney("-1.00", "BRL"); !errors.Is(err, ErrNegativeAmount) {
+		t.Errorf("NewMoney(-1.00) error = %v", err)
+	}
+	if _, err := MoneyFromCents(-1, "BRL"); !errors.Is(err, ErrNegativeAmount) {
+		t.Errorf("MoneyFromCents(-1) error = %v", err)
+	}
+	negative := Money{cents: -100, currency: "BRL"}
+	w := Wallet{Balance: Money{cents: 1000, currency: "BRL"}, Version: 2}
+	if _, err := w.Debit(negative); !errors.Is(err, ErrNonPositiveAmount) {
+		t.Errorf("Debit(negative) error = %v", err)
+	}
+	if _, err := w.Credit(negative); !errors.Is(err, ErrNonPositiveAmount) {
+		t.Errorf("Credit(negative) error = %v", err)
+	}
+}
+
+func TestMoneyFromSignedCents(t *testing.T) {
+	for cents, want := range map[int64]string{-2550: "-25.50", 0: "0.00", math.MaxInt64: "92233720368547758.07", math.MinInt64: "-92233720368547758.08"} {
+		m, err := MoneyFromSignedCents(cents, "BRL")
+		if err != nil || m.Amount() != want {
+			t.Errorf("MoneyFromSignedCents(%d) = %v, %v; want %s", cents, m, err, want)
+		}
+	}
+	if _, err := MoneyFromSignedCents(-1, "ZZZ"); !errors.Is(err, ErrInvalidCurrency) {
+		t.Errorf("invalid currency error = %v", err)
 	}
 }

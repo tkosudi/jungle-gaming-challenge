@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-jungle}
       POSTGRES_USER: ${POSTGRES_USER:-jungle}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdev-only}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
@@ -24,8 +24,14 @@ services:
       - --import-realm
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:-admin}
-      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:-local-admin-only}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:?set KC_BOOTSTRAP_ADMIN_PASSWORD in .env (see .env.example)}
       KC_HOSTNAME: http://localhost:${KEYCLOAK_PORT:-8180}
+      # Lidos pelos placeholders de infra/keycloak/realm.json na importação do realm.
+      PROVIDER_A_CLIENT_SECRET: ${PROVIDER_A_CLIENT_SECRET:?set it in .env}
+      PROVIDER_B_CLIENT_SECRET: ${PROVIDER_B_CLIENT_SECRET:?set it in .env}
+      INTERNAL_SERVICE_CLIENT_SECRET: ${INTERNAL_SERVICE_CLIENT_SECRET:?set it in .env}
+      TEST_OTHER_AUDIENCE_CLIENT_SECRET: ${TEST_OTHER_AUDIENCE_CLIENT_SECRET:?set it in .env}
+      TEST_SHORT_LIVED_CLIENT_SECRET: ${TEST_SHORT_LIVED_CLIENT_SECRET:?set it in .env}
     ports:
       - "127.0.0.1:${KEYCLOAK_PORT:-8180}:8080"
     volumes:
@@ -48,7 +54,7 @@ services:
       dockerfile: Dockerfile
     environment:
       HTTP_ADDR: ":8080"
-      DATABASE_URL: "postgres://${POSTGRES_USER:-jungle}:${POSTGRES_PASSWORD:-localdev-only}@postgres:5432/${POSTGRES_DB:-jungle}?sslmode=disable"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-jungle}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-jungle}?sslmode=disable"
       OIDC_ISSUER_URL: "http://localhost:${KEYCLOAK_PORT:-8180}/realms/jungle"
       OIDC_JWKS_URL: "http://keycloak:8080/realms/jungle/protocol/openid-connect/certs"
       OIDC_AUDIENCE: "wagering-api"

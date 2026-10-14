@@ -12,7 +12,9 @@ import (
 
 	"go.uber.org/fx"
 
+	"github.com/tkosudi/jungle-gaming-challenge/internal/auth"
 	"github.com/tkosudi/jungle-gaming-challenge/internal/config"
+	"github.com/tkosudi/jungle-gaming-challenge/internal/usecase"
 )
 
 func newTestFxApp(t *testing.T, addr string, srv **Server) *fx.App {
@@ -20,6 +22,12 @@ func newTestFxApp(t *testing.T, addr string, srv **Server) *fx.App {
 	return fx.New(
 		fx.NopLogger,
 		fx.Supply(config.Config{HTTPAddr: addr}),
+		// Só /health/live é exercitado: o Service e o verificador não são usados.
+		fx.Provide(
+			func() *usecase.Service { return nil },
+			func() *auth.Verifier { return nil },
+			func() Pinger { return pinger{} },
+		),
 		Module,
 		fx.Populate(srv),
 	)
@@ -100,7 +108,7 @@ func TestServer_StartFailsWhenPortInUse(t *testing.T) {
 // Garante que o shutdown intencional não é visto como falha do serve; do
 // contrário o módulo acionaria o Shutdowner com código 1 durante o Stop.
 func TestServer_ServeReturnsNilAfterShutdown(t *testing.T) {
-	s := NewServer(config.Config{HTTPAddr: "127.0.0.1:0"}, NewApp())
+	s := NewServer(config.Config{HTTPAddr: "127.0.0.1:0"}, NewApp(nil, nil, pinger{}))
 	if err := s.listen(ctxWithTimeout(t, 5*time.Second)); err != nil {
 		t.Fatalf("listen() error = %v", err)
 	}
@@ -139,7 +147,7 @@ func TestServer_ServeReturnsNilAfterShutdown(t *testing.T) {
 // Shutdown imediatamente após iniciar o serve (Stop logo depois do Start) não
 // pode deixar o serve bloqueado nem o listener aberto.
 func TestServer_ShutdownBeforeServeRegistersListener(t *testing.T) {
-	s := NewServer(config.Config{HTTPAddr: "127.0.0.1:0"}, NewApp())
+	s := NewServer(config.Config{HTTPAddr: "127.0.0.1:0"}, NewApp(nil, nil, pinger{}))
 	if err := s.listen(ctxWithTimeout(t, 5*time.Second)); err != nil {
 		t.Fatalf("listen() error = %v", err)
 	}
@@ -168,7 +176,7 @@ func TestServer_ShutdownBeforeServeRegistersListener(t *testing.T) {
 // Fechamento inesperado do listener (sem shutdown) não pode ser tratado como
 // encerramento normal: o serve deve reportar erro para o módulo derrubar a app.
 func TestServer_ServeReportsUnexpectedListenerClose(t *testing.T) {
-	s := NewServer(config.Config{HTTPAddr: "127.0.0.1:0"}, NewApp())
+	s := NewServer(config.Config{HTTPAddr: "127.0.0.1:0"}, NewApp(nil, nil, pinger{}))
 	if err := s.listen(ctxWithTimeout(t, 5*time.Second)); err != nil {
 		t.Fatalf("listen() error = %v", err)
 	}

@@ -11,8 +11,9 @@ Registro das decisões aprovadas, com o status real de implementação. O enunci
 | Idempotência persistente e locking por carteira no caso de uso (M1.2) | Implementado e testado; entrada HTTP/SQS pendente |
 | `WIN`, `LOSS`, `REFUND`, `ROLLBACK`, referências pendentes e passo transacional do worker (M1.3) | Implementado e testado; sem HTTP e sem laço automático do worker (M3) |
 | Outbox (persistência) | Implementado (M1.2); sem publicador |
+| API HTTP, autenticação OIDC (Keycloak), composição Fx do núcleo e reconciliação (M2, M2.1) | Implementado e testado com PostgreSQL e Keycloak reais |
 | Inbox, laço do worker de referências com Fx, publicador SQS | Pendente |
-| Autenticação/autorização, SQS, observabilidade | Pendente |
+| SQS; métricas além da reconciliação | Pendente |
 
 ## Migrations: golang-migrate (e não Atlas)
 
@@ -117,7 +118,7 @@ Implementado: `Money`, abertura de carteira, `BET` síncrona, idempotência pers
 `int64` em centavos, escala fixa de duas casas, sem sinal, espaço, zeros à esquerda ou notação científica; overflow detectado no parsing e na soma. Moedas: subconjunto ISO 4217 ativo com duas casas decimais (lista fixa em `money.go`); JPY, KWD e códigos de teste ficam de fora por não caberem na escala do contrato.
 
 ### Identidade do provedor
-`Process(ctx, providerID, operation)` recebe o provedor como argumento separado dos dados da BET. Quem chamar (HTTP/SQS) deve derivá-lo da identidade autenticada. Hoje nada impede um chamador interno de passar um valor arbitrário; a derivação autenticada é pendente do milestone de autenticação.
+`Process(ctx, providerID, operation)` recebe o provedor como argumento separado dos dados da operação. Desde o M2 o HTTP o deriva do token (seção M2); o consumidor SQS fará o mesmo a partir das credenciais do broker.
 
 ### Idempotência
 - Hash canônico (`Operation.PayloadHash`, desde o M1.3): SHA-256 do JSON compacto com chaves em ordem alfabética (`amount`, `currency`, `externalTransactionId`, `gameId`, `kind`, `playerId`, `providerId`, `referenceExternalTransactionId` se houver, `roundId`, `walletId`), UUIDs em minúsculas, valor `d.dd`, sem escape de HTML; chave de idempotência e metadados de transporte fora do hash. Vetor conhecido em `operation_test.go`. Substituiu o formato binário do M1.2 (sem dados persistidos a migrar).
@@ -187,3 +188,84 @@ Trigger `AFTER INSERT OR UPDATE` em `wager_transactions` para linhas `PROCESSED`
 - Testes PostgreSQL reais: REFUND × ROLLBACK concorrentes (10 rodadas, 3 instâncias), DEC-001 histórica, ROLLBACK(WIN) sem saldo, LOSS sem ledger, pendência/replay/resolução/expiração, workers concorrentes (1 pendência × 8 chamadas; 12 carteiras × 3 workers), worker × REFUND síncrono, recuperação por outra instância, falhas injetadas sem `FAILED`.
 - Mutações verificadas: remover o `FOR UPDATE` da carteira, o `SKIP LOCKED`, a consulta antes da expiração e a proteção de referência pendente fazem testes falharem.
 - Pendente: teste com três **processos**; o passo resolve a pendência no próximo ciclo (a chegada da referência não a resolve na hora); `Money` sem negativos/negação e `Wallet` com campos exportados (requisitos do §6, para o milestone de reconciliação); `provider_id` ainda é argumento confiável do chamador.
+
+## API HTTP, autenticação e composição (M2)
+
+Implementado: rotas de carteira, envio e consulta de operações, health checks, validação de JWT do Keycloak e composição Fx de `Store`, `Service`, verificador e servidor. A reconciliação veio no M2.1 (seção seguinte). Não implementado: readiness do SQS e SQS (M3).
+
+### Validação de tokens
+- Biblioteca `github.com/coreos/go-oidc/v3` v3.21.0, sem descoberta: `RemoteKeySet` sobre `OIDC_JWKS_URL` (cache em memória, nova busca quando aparece um `kid` desconhecido) e `IDTokenVerifier` com **issuer exato** (`OIDC_ISSUER_URL`), **audience** `wagering-api` (`OIDC_AUDIENCE`), **somente RS256**, `exp` sem tolerância e `nbf`. Além disso, `typ` precisa ser `Bearer`: ID tokens do Keycloak são recusados.
+- Keycloak no Docker: o `KC_HOSTNAME` fixa o issuer público (`http://localhost:8180/realms/jungle`) em todo token, inclusive nos obtidos pela rede interna. A API valida esse issuer e busca as chaves por `http://keycloak:8080/...` (`OIDC_JWKS_URL`). Separar "de onde vêm as chaves" de "quem é o emissor esperado" evita afrouxar o `iss`. Evidência: token pedido a `keycloak:8080` de dentro da rede do Compose tem `iss` público e foi aceito pela API em contêiner.
+- Falha ao obter o JWKS (rede, 5xx, prazo) é `503 IDP_UNAVAILABLE`, não `401`: o go-oidc formata o erro do `KeySet` com `%v`, então o sinal volta por um ponteiro no contexto da chamada.
+
+### Identidade e permissões
+| Identidade (client_credentials) | Papel de realm | `provider_id` (claim fixo por cliente) | Pode |
+| --- | --- | --- | --- |
+| `provider-a`, `provider-b` | `wagering-provider` | o próprio | `POST /wagering/transactions`, `GET /wagering/transactions/:id`, `GET /providers/:providerId/wagering/transactions/:externalId` |
+| `internal-service` | `wallet-operator` | — | `POST /wallets`, `GET /wallets/:id`, `GET /wallets/:id/ledger` |
+
+- O provedor da operação vem **só** do claim `provider_id` do token validado. O `providerId` do corpo precisa ser igual (senão `403 PROVIDER_MISMATCH`, sem persistir nada); headers não influenciam.
+- Isolamento no SQL: as consultas de transação filtram por `provider_id`, e a de outro provedor responde `404`, igual a inexistente. `providerId` do caminho diferente do token é `403`. Replays já eram isolados pelas UNIQUEs por provedor.
+- Rotas sem papel adequado: `403 FORBIDDEN` (`WWW-Authenticate: Bearer error="insufficient_scope"`). Token ausente ou inválido: `401 UNAUTHENTICATED`.
+- Identidades de teste do realm local: `test-other-audience` (provedor sem a audience `wagering-api`) e `test-short-lived` (token de 2s). Existem para provar com o Keycloak real a recusa de audience e de expiração.
+
+### Contrato HTTP
+Erros: `{"error":{"code":"...","message":"..."}}`. `POST /wagering/transactions` (header `Idempotency-Key` obrigatório, usado como recebido):
+
+| Situação | Status | Corpo |
+| --- | --- | --- |
+| `PROCESSED` (novo ou replay) | 200 | `transactionId`, `status`, `balance`, `idempotentReplay` |
+| `PENDING_REFERENCE` | 202 + `Location` | idem, sem `balance` |
+| `REJECTED` (rejeição de negócio persistida) | 422 | idem, com `failureCode` |
+| Entrada inválida (JSON, campos desconhecidos, valor numérico em vez de string, escala, moeda, tipo, chave ausente) | 400 `VALIDATION_ERROR` | erro |
+| Conflito de idempotência | 409 `IDEMPOTENCY_CONFLICT` | erro |
+| Lock da carteira esgotado, banco indisponível, prazo esgotado, commit incerto | 503 (`WALLET_BUSY`, `SERVICE_UNAVAILABLE`, `OUTCOME_UNKNOWN`) + `Retry-After` | erro; reenviar com a mesma chave é seguro |
+
+`POST /wallets`: 201, ou 409 `WALLET_ALREADY_EXISTS`. Ledger: ordem pela versão da carteira; cursor opaco (base64url de `{carteira, última versão}`, recusado em outra carteira); `limit` de 1 a 100, padrão 50. Corpo limitado a 64 KiB (413), `Content-Type` JSON obrigatório (415). `GET /health/ready` verifica o PostgreSQL.
+
+Falhas de conexão do banco (recusa, perda antes do COMMIT, SQLSTATE `08*`, `57P0*`, `53300`) viram `usecase.ErrUnavailable`: nada foi confirmado.
+
+### Composição Fx
+`postgres.Module` fornece pool e `usecase.Store` (`lock_timeout` 5s); `app` fornece `Service` (`DefaultReferencePolicy`), verificador e `Pinger`; `httpapi.Module` fornece app Fiber e servidor. Ordem de hooks preservada: PostgreSQL inicia antes do HTTP e fecha depois dele. Service e verificador não têm hooks, porque não abrem recursos.
+
+### Evidências e limites do M2
+- Unitários (sem banco; tokens RSA reais e JWKS local): assinatura de outra chave, alg `none`, HS256 com a chave pública, issuer interno/estranho, audience errada/ausente, expirado, `nbf` futuro, `typ` ID, adulterado, JWKS 503/inacessível; autorização por rota; validação; limite de corpo.
+- Ponta a ponta (`tests/`, Fx completo, PostgreSQL e Keycloak reais): fluxo de carteira e operações, replays, conflito, 422, 202 com consulta, isolamento entre provedores, `providerId` forjado no corpo ou em header, assinatura e payload adulterados, audience incorreta, token expirado, segredo errado recusado pelo Keycloak; 100/80/80 e 30 requisições idênticas distribuídas por 3 instâncias Fx com pools próprios.
+- Mutações verificadas: aceitar o `providerId` do corpo, pular a verificação de audience e a de issuer fazem testes falharem.
+- Smoke test na API do Compose: 401/403/201/200 (novo e replay)/404 entre provedores.
+- Limites: três processos reais continuam pendentes (as instâncias são do mesmo processo de teste); atualizar papéis no `realm.json` exige recriar o contêiner do Keycloak (`docker compose up -d --force-recreate keycloak`), que só importa realms inexistentes.
+
+## Reconciliação, Money com sinal e endurecimento do OIDC (M2.1)
+
+### Money com sinal
+`Money` passou a admitir valores negativos **só como resultado de aritmética interna** (`Sub`, `Neg`, `Add` com negativos), com overflow detectado nos dois sentidos (inclusive `Neg(MinInt64)`) e `Amount()` formatando `-d.dd`. A fronteira não mudou: `NewMoney` (entrada externa) e `MoneyFromCents` (reidratação) recusam negativos, `Wallet.Debit/Credit` exigem valor positivo, `OpenWallet` recusa saldo inicial negativo e o banco mantém `balance >= 0`. Mudança de contrato do M1.2: `Sub` abaixo de zero devolvia `ErrNegativeAmount` e agora devolve o valor negativo (o único uso em produção, `Wallet.Debit`, compara antes de subtrair).
+
+### Reconciliação (`POST /wallets/:walletId/reconciliation`, papel `wallet-operator`)
+- Um único `SELECT` lê `wallets.balance` e o saldo líquido do ledger (créditos − débitos, inclusive a `OPENING`) no **mesmo snapshot**, sem `FOR UPDATE`: não espera nem bloqueia escritores. Duas leituras separadas em READ COMMITTED poderiam ver commits diferentes e acusar divergência falsa.
+- A transação é `READ ONLY` (`Store.InReadOnlyTx`): o banco recusa qualquer escrita (`25006`, testado), além de o código não escrever.
+- O líquido é somado em `numeric` e só ele vira `bigint`: os totais históricos de cada direção podem passar de `int64` com o saldo válido (regressão testada: abertura de `MaxInt64` centavos, BET e WIN de 0.01). Em Go, `difference = armazenado − calculado` com o `Money` assinado (`MoneyFromSignedCents` reidrata o líquido, que só é negativo num ledger corrompido); `consistent = difference == 0`; `checkedEntries` = lançamentos lidos.
+- Divergência: `slog.Warn` em JSON (`walletId`, `currency`, `storedBalance`, `calculatedBalance`, `difference`, `checkedEntries`) e o contador Prometheus `wallet_reconciliations_total{result="divergent"}`; as séries `consistent`/`divergent` existem desde a partida (valor 0). Exposto em `GET /metrics` (registro próprio, só métricas da aplicação, público como os health checks). Logs da aplicação passaram a ser JSON (`cmd/api`).
+- Dependência nova: `github.com/prometheus/client_golang` v1.24.1 (a v1.25.0 tinha menos de duas semanas).
+
+### Limite de buscas ao JWKS
+O go-oidc busca o JWKS de novo a cada `kid` desconhecido **e** a cada assinatura que não confere. O transporte do JWKS permite uma busca a cada 5s (`jwksMinRefreshInterval`); buscas simultâneas já são agrupadas pelo go-oidc. Consequências:
+- Token forjado com `kid` desconhecido: `503 IDP_UNAVAILABLE` sem tocar o IdP; assinatura inválida com `kid` já verificado: `401` (a chave está em cache).
+- Chave legitimamente rotacionada no Keycloak dentro de 5s após outra busca: até 5s de `503` com `Retry-After` para tokens com o `kid` novo. Trade-off aceito.
+
+### Vínculo entre cliente e provedor (responsabilidade do IdP)
+A API confia no claim `provider_id` porque ele é fixado pelo Keycloak por cliente (mapper hardcoded no `realm.json`), não pelo cliente. Logo, o vínculo `azp` → `provider_id` é **configuração confiável do IdP**: quem administra o realm decide qual cliente fala por qual provedor, e um cliente mal configurado agiria por outro provedor. A API não confere `azp`. Os clientes `test-other-audience` e `test-short-lived` emitem `provider_id = provider-a` e existem só no realm local de testes: não podem ser provisionados nem tratados como clientes de produção, e um realm de produção deve ser gerado sem eles.
+
+### Evidências do M2.1
+- Unitários: aritmética assinada e overflow; fronteira sem negativos; autorização e validação da rota; `/metrics`; 20 tokens com `kid` desconhecido geram 1 só busca ao JWKS; rotação depois do intervalo; 10 primeiras requisições simultâneas geram 1 busca; assinatura inválida com `kid` conhecido é 401.
+- PostgreSQL real:
+  - carteira coerente com abertura e uma BET (`checkedEntries = 2`);
+  - abertura zero (0 lançamentos);
+  - todos os tipos de movimento;
+  - divergências positiva (`5.00`) e negativa (`-25.50`), criadas desligando os triggers como dono das tabelas (limite D8), com log JSON e métrica conferidos e saldo/ledger inalterados;
+  - cerca de 900 reconciliações durante 300 escritas concorrentes de 2 instâncias, todas `consistent`, repetido 5 vezes;
+  - resposta com a carteira travada por outro escritor e `lock_timeout` de 200 ms;
+  - transação somente leitura recusa escrita.
+- Ponta a ponta: contrato de 6 campos com `checkedEntries = 2` após abertura e BET; 403 para provedor, 401 sem token, 404 para carteira inexistente, contador visível em `/metrics`.
+
+### Segredos locais
+Nenhuma senha ou client secret fica em arquivo versionado. O `realm.json` usa placeholders `${PROVIDER_A_CLIENT_SECRET}` etc., que o Keycloak 26.8.0 resolve do ambiente ao importar o realm (validado: o secret do `.env` obtém token, o literal antigo e o placeholder cru recebem 401). O Compose passa esses valores ao Keycloak e exige (`${VAR:?}`) as senhas do PostgreSQL e do administrador e os client secrets. Os valores reais ficam no `.env` local, ignorado pelo Git; o `.env.example` só tem marcadores `change-me-*`. Os testes de integração leem as mesmas variáveis do ambiente ou, na ausência delas, do `.env` (`internal/testenv`, usado só por testes). Sem secret manager: para o desafio, `.env` local basta.

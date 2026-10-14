@@ -44,6 +44,10 @@ func (s *Service) OpenWallet(ctx context.Context, playerID uuid.UUID, initial do
 	if initial.Currency() == "" {
 		return OpenWalletResult{}, domain.ErrInvalidCurrency
 	}
+	// Money admite negativos em cálculos internos; o saldo de uma carteira, nunca.
+	if initial.IsNegative() {
+		return OpenWalletResult{}, domain.ErrNegativeAmount
+	}
 	var result OpenWalletResult
 	err := s.store.InTx(ctx, func(tx Tx) error {
 		at := time.Now().UTC()
