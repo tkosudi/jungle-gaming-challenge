@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -18,13 +17,17 @@ import (
 
 	"github.com/tkosudi/jungle-gaming-challenge/internal/config"
 	"github.com/tkosudi/jungle-gaming-challenge/internal/httpapi"
+
+	"github.com/tkosudi/jungle-gaming-challenge/internal/testenv"
 )
 
-func testDatabaseURL() string {
-	if v := os.Getenv("TEST_DATABASE_URL"); v != "" {
-		return v
-	}
-	return "postgres://jungle:localdev-only@127.0.0.1:5432/jungle?sslmode=disable"
+func testDatabaseURL() string { return testenv.DatabaseURL() }
+
+// testOIDC aponta para o Keycloak do Compose; o JWKS só é buscado quando um token é verificado.
+var testOIDC = config.OIDC{
+	IssuerURL: "http://localhost:8180/realms/jungle",
+	JWKSURL:   "http://localhost:8180/realms/jungle/protocol/openid-connect/certs",
+	Audience:  "wagering-api",
 }
 
 func ctxTimeout(t *testing.T, d time.Duration) context.Context {
@@ -48,7 +51,7 @@ func newApp(t *testing.T, cfg config.Config) (*fx.App, *httpapi.Server, *pgxpool
 }
 
 func TestApp_StartServesAndStopsReleasingResources(t *testing.T) {
-	app, srv, pool := newApp(t, config.Config{HTTPAddr: "127.0.0.1:0", DatabaseURL: testDatabaseURL()})
+	app, srv, pool := newApp(t, config.Config{HTTPAddr: "127.0.0.1:0", DatabaseURL: testDatabaseURL(), OIDC: testOIDC})
 
 	if err := app.Start(ctxTimeout(t, 10*time.Second)); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -94,7 +97,7 @@ func TestApp_StartFailsWhenHTTPPortBusy_ReleasesPool(t *testing.T) {
 	}
 	defer busy.Close()
 
-	app, _, pool := newApp(t, config.Config{HTTPAddr: busy.Addr().String(), DatabaseURL: testDatabaseURL()})
+	app, _, pool := newApp(t, config.Config{HTTPAddr: busy.Addr().String(), DatabaseURL: testDatabaseURL(), OIDC: testOIDC})
 
 	err = app.Start(ctxTimeout(t, 10*time.Second))
 	if err == nil {
@@ -121,6 +124,7 @@ func TestApp_StartFailsWhenDatabaseUnavailable(t *testing.T) {
 	app, srv, _ := newApp(t, config.Config{
 		HTTPAddr:    "127.0.0.1:0",
 		DatabaseURL: fmt.Sprintf("postgres://jungle:x@%s/jungle?sslmode=disable", dead),
+		OIDC:        testOIDC,
 	})
 
 	begin := time.Now()

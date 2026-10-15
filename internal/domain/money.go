@@ -48,8 +48,10 @@ func ParseCurrency(code string) (Currency, error) {
 }
 
 // Money é um valor imutável em unidades mínimas (centavos) com moeda explícita.
-// Nunca é negativo: diferenças que ficariam abaixo de zero são erro, não valor.
-// O zero value (sem moeda) é inválido e rejeitado por todas as operações.
+// Valores negativos existem apenas como resultado de aritmética interna (diferenças, como a
+// da reconciliação): NewMoney e MoneyFromCents recusam negativos, e a carteira só aceita
+// movimentações positivas e nunca fica abaixo de zero. Soma, subtração e negação detectam
+// overflow do int64. O zero value (sem moeda) é inválido e rejeitado por todas as operações.
 type Money struct {
 	cents    int64
 	currency Currency
@@ -76,6 +78,16 @@ func MoneyFromCents(cents int64, currency Currency) (Money, error) {
 	}
 	if cents < 0 {
 		return Money{}, ErrNegativeAmount
+	}
+	return Money{cents: cents, currency: currency}, nil
+}
+
+// MoneyFromSignedCents reconstrói um resultado interno que pode ser negativo, como o saldo
+// reconstruído pela reconciliação de um ledger corrompido. Nunca para entradas externas nem
+// para saldos de carteira, que usam NewMoney e MoneyFromCents.
+func MoneyFromSignedCents(cents int64, currency Currency) (Money, error) {
+	if _, ok := supportedCurrencies[currency]; !ok {
+		return Money{}, fmt.Errorf("%w: %q", ErrInvalidCurrency, string(currency))
 	}
 	return Money{cents: cents, currency: currency}, nil
 }
@@ -113,18 +125,26 @@ func (m Money) Cents() int64       { return m.cents }
 func (m Money) Currency() Currency { return m.currency }
 
 // Amount formata o valor como "123.45" usando apenas aritmética inteira.
-func (m Money) Amount() string { return fmt.Sprintf("%d.%02d", m.cents/100, m.cents%100) }
+func (m Money) Amount() string {
+	sign, abs := "", uint64(m.cents)
+	if m.cents < 0 {
+		// uint64(-x) com x = MinInt64 continua correto: o valor absoluto cabe em uint64.
+		sign, abs = "-", uint64(-(m.cents+1))+1
+	}
+	return fmt.Sprintf("%s%d.%02d", sign, abs/100, abs%100)
+}
 
 func (m Money) String() string { return m.Amount() + " " + string(m.currency) }
 
 func (m Money) IsZero() bool     { return m.currency != "" && m.cents == 0 }
 func (m Money) IsPositive() bool { return m.currency != "" && m.cents > 0 }
+func (m Money) IsNegative() bool { return m.currency != "" && m.cents < 0 }
 
 func (m Money) Add(o Money) (Money, error) {
 	if err := m.compatible(o); err != nil {
 		return Money{}, err
 	}
-	if m.cents > math.MaxInt64-o.cents {
+	if (o.cents > 0 && m.cents > math.MaxInt64-o.cents) || (o.cents < 0 && m.cents < math.MinInt64-o.cents) {
 		return Money{}, ErrAmountOverflow
 	}
 	return Money{cents: m.cents + o.cents, currency: m.currency}, nil
@@ -134,10 +154,21 @@ func (m Money) Sub(o Money) (Money, error) {
 	if err := m.compatible(o); err != nil {
 		return Money{}, err
 	}
-	if m.cents < o.cents {
-		return Money{}, ErrNegativeAmount
+	if (o.cents < 0 && m.cents > math.MaxInt64+o.cents) || (o.cents > 0 && m.cents < math.MinInt64+o.cents) {
+		return Money{}, ErrAmountOverflow
 	}
 	return Money{cents: m.cents - o.cents, currency: m.currency}, nil
+}
+
+// Neg devolve o valor com o sinal invertido; -MinInt64 não cabe em int64 e é overflow.
+func (m Money) Neg() (Money, error) {
+	if m.currency == "" {
+		return Money{}, ErrInvalidCurrency
+	}
+	if m.cents == math.MinInt64 {
+		return Money{}, ErrAmountOverflow
+	}
+	return Money{cents: -m.cents, currency: m.currency}, nil
 }
 
 // Compare devolve -1, 0 ou 1.

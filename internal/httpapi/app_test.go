@@ -11,7 +11,7 @@ import (
 
 func getLive(t *testing.T, mutate func(*http.Request)) *http.Response {
 	t.Helper()
-	app := NewApp()
+	app := newTestApp(t, nil)
 	req := httptest.NewRequest(http.MethodGet, "/health/live", nil)
 	if mutate != nil {
 		mutate(req)
@@ -59,7 +59,7 @@ func TestHealthLive_NoAuthenticationRequired(t *testing.T) {
 }
 
 func TestUnknownRoute_Returns404(t *testing.T) {
-	app := NewApp()
+	app := newTestApp(t, nil)
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/nope", nil))
 	if err != nil {
 		t.Fatalf("app.Test() error = %v", err)

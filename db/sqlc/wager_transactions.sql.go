@@ -184,6 +184,131 @@ func (q *Queries) GetDuePendingReference(ctx context.Context, id uuid.UUID) (Get
 	return i, err
 }
 
+const getProviderTransaction = `-- name: GetProviderTransaction :one
+SELECT id, kind, status, provider_id, external_transaction_id, player_id, wallet_id, round_id, game_id,
+       amount, currency, reference_external_transaction_id, reference_transaction_id, failure_code,
+       result_balance, reference_attempts, next_attempt_at, created_at, updated_at
+FROM wager_transactions
+WHERE id = $1 AND provider_id = $2
+`
+
+type GetProviderTransactionParams struct {
+	ID         uuid.UUID
+	ProviderID *string
+}
+
+type GetProviderTransactionRow struct {
+	ID                             uuid.UUID
+	Kind                           string
+	Status                         string
+	ProviderID                     *string
+	ExternalTransactionID          *string
+	PlayerID                       uuid.UUID
+	WalletID                       *uuid.UUID
+	RoundID                        *string
+	GameID                         *string
+	Amount                         int64
+	Currency                       string
+	ReferenceExternalTransactionID *string
+	ReferenceTransactionID         *uuid.UUID
+	FailureCode                    *string
+	ResultBalance                  *int64
+	ReferenceAttempts              int32
+	NextAttemptAt                  *time.Time
+	CreatedAt                      time.Time
+	UpdatedAt                      time.Time
+}
+
+// O filtro por provedor faz parte da consulta: transação de outro provedor é "não encontrada".
+func (q *Queries) GetProviderTransaction(ctx context.Context, arg GetProviderTransactionParams) (GetProviderTransactionRow, error) {
+	row := q.db.QueryRow(ctx, getProviderTransaction, arg.ID, arg.ProviderID)
+	var i GetProviderTransactionRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Status,
+		&i.ProviderID,
+		&i.ExternalTransactionID,
+		&i.PlayerID,
+		&i.WalletID,
+		&i.RoundID,
+		&i.GameID,
+		&i.Amount,
+		&i.Currency,
+		&i.ReferenceExternalTransactionID,
+		&i.ReferenceTransactionID,
+		&i.FailureCode,
+		&i.ResultBalance,
+		&i.ReferenceAttempts,
+		&i.NextAttemptAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getProviderTransactionByExternalID = `-- name: GetProviderTransactionByExternalID :one
+SELECT id, kind, status, provider_id, external_transaction_id, player_id, wallet_id, round_id, game_id,
+       amount, currency, reference_external_transaction_id, reference_transaction_id, failure_code,
+       result_balance, reference_attempts, next_attempt_at, created_at, updated_at
+FROM wager_transactions
+WHERE provider_id = $1 AND external_transaction_id = $2
+`
+
+type GetProviderTransactionByExternalIDParams struct {
+	ProviderID            *string
+	ExternalTransactionID *string
+}
+
+type GetProviderTransactionByExternalIDRow struct {
+	ID                             uuid.UUID
+	Kind                           string
+	Status                         string
+	ProviderID                     *string
+	ExternalTransactionID          *string
+	PlayerID                       uuid.UUID
+	WalletID                       *uuid.UUID
+	RoundID                        *string
+	GameID                         *string
+	Amount                         int64
+	Currency                       string
+	ReferenceExternalTransactionID *string
+	ReferenceTransactionID         *uuid.UUID
+	FailureCode                    *string
+	ResultBalance                  *int64
+	ReferenceAttempts              int32
+	NextAttemptAt                  *time.Time
+	CreatedAt                      time.Time
+	UpdatedAt                      time.Time
+}
+
+func (q *Queries) GetProviderTransactionByExternalID(ctx context.Context, arg GetProviderTransactionByExternalIDParams) (GetProviderTransactionByExternalIDRow, error) {
+	row := q.db.QueryRow(ctx, getProviderTransactionByExternalID, arg.ProviderID, arg.ExternalTransactionID)
+	var i GetProviderTransactionByExternalIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Status,
+		&i.ProviderID,
+		&i.ExternalTransactionID,
+		&i.PlayerID,
+		&i.WalletID,
+		&i.RoundID,
+		&i.GameID,
+		&i.Amount,
+		&i.Currency,
+		&i.ReferenceExternalTransactionID,
+		&i.ReferenceTransactionID,
+		&i.FailureCode,
+		&i.ResultBalance,
+		&i.ReferenceAttempts,
+		&i.NextAttemptAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const insertOpeningTransaction = `-- name: InsertOpeningTransaction :exec
 INSERT INTO wager_transactions (
     id, kind, status, wallet_id, player_id, amount, currency, result_balance, created_at, updated_at)

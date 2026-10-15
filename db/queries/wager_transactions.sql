@@ -65,3 +65,18 @@ WHERE id = $1 AND status = 'PENDING_REFERENCE';
 UPDATE wager_transactions
 SET reference_attempts = $2, next_attempt_at = now() + ($3::bigint * interval '1 millisecond'), updated_at = $4
 WHERE id = $1 AND status = 'PENDING_REFERENCE';
+
+-- name: GetProviderTransaction :one
+-- O filtro por provedor faz parte da consulta: transação de outro provedor é "não encontrada".
+SELECT id, kind, status, provider_id, external_transaction_id, player_id, wallet_id, round_id, game_id,
+       amount, currency, reference_external_transaction_id, reference_transaction_id, failure_code,
+       result_balance, reference_attempts, next_attempt_at, created_at, updated_at
+FROM wager_transactions
+WHERE id = $1 AND provider_id = $2;
+
+-- name: GetProviderTransactionByExternalID :one
+SELECT id, kind, status, provider_id, external_transaction_id, player_id, wallet_id, round_id, game_id,
+       amount, currency, reference_external_transaction_id, reference_transaction_id, failure_code,
+       result_balance, reference_attempts, next_attempt_at, created_at, updated_at
+FROM wager_transactions
+WHERE provider_id = $1 AND external_transaction_id = $2;

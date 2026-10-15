@@ -7,19 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"testing"
 	"time"
+
+	"github.com/tkosudi/jungle-gaming-challenge/internal/testenv"
 )
 
-// Banco de teste: TEST_DATABASE_URL ou, na ausência, o PostgreSQL local do Compose
-// (valores de .env.example, sem segredos reais).
-func testDatabaseURL() string {
-	if v := os.Getenv("TEST_DATABASE_URL"); v != "" {
-		return v
-	}
-	return "postgres://jungle:localdev-only@127.0.0.1:5432/jungle?sslmode=disable"
-}
+// Banco de teste: TEST_DATABASE_URL ou o PostgreSQL local do Compose, com as credenciais
+// do ambiente ou do .env local (ver internal/testenv).
+func testDatabaseURL() string { return testenv.DatabaseURL() }
 
 func TestNewPool_ConnectsToRealPostgres(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

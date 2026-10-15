@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,9 +41,19 @@ func NewStore(pool *pgxpool.Pool, lockTimeout time.Duration) *Store {
 // FOR UPDATE, feito por fn) é o que serializa escritores; READ COMMITTED basta porque cada
 // statement vê o commit anterior da carteira depois de obter o lock.
 func (s *Store) InTx(ctx context.Context, fn func(usecase.Tx) error) error {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	return s.run(ctx, pgx.ReadWrite, fn)
+}
+
+// InReadOnlyTx executa fn numa transação READ COMMITTED READ ONLY: o PostgreSQL recusa
+// qualquer escrita (25006), o que garante no banco que a operação só lê.
+func (s *Store) InReadOnlyTx(ctx context.Context, fn func(usecase.Tx) error) error {
+	return s.run(ctx, pgx.ReadOnly, fn)
+}
+
+func (s *Store) run(ctx context.Context, mode pgx.TxAccessMode, fn func(usecase.Tx) error) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: mode})
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return fmt.Errorf("begin transaction: %w", mapError(err))
 	}
 	// Idempotente depois do commit; no erro, desfaz mesmo com ctx cancelado.
 	defer func() {
@@ -67,10 +80,24 @@ func (s *Store) InTx(ctx context.Context, fn func(usecase.Tx) error) error {
 	return nil
 }
 
+// mapError classifica as falhas que o chamador pode tratar: lock_timeout e indisponibilidade do
+// banco (conexão recusada ou perdida, servidor encerrando ou sem conexões livres). Nos dois casos a
+// transação não foi confirmada. Falhas durante o COMMIT são tratadas à parte em InTx.
 func mapError(err error) error {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == sqlstateLockNotAvailable {
-		return fmt.Errorf("%w: %v", usecase.ErrLockTimeout, err)
+	if errors.As(err, &pgErr) {
+		switch {
+		case pgErr.Code == sqlstateLockNotAvailable:
+			return fmt.Errorf("%w: %v", usecase.ErrLockTimeout, err)
+		case strings.HasPrefix(pgErr.Code, "08"), pgErr.Code == "53300", strings.HasPrefix(pgErr.Code, "57P0"):
+			return fmt.Errorf("%w: %v", usecase.ErrUnavailable, err)
+		}
+		return err
+	}
+	var connectErr *pgconn.ConnectError
+	var netErr net.Error
+	if errors.As(err, &connectErr) || errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("%w: %v", usecase.ErrUnavailable, err)
 	}
 	return err
 }
@@ -311,4 +338,116 @@ func toWallet(id, playerID uuid.UUID, currency string, balance, version int64) (
 		return domain.Wallet{}, fmt.Errorf("wallet %s balance: %w", id, err)
 	}
 	return domain.Wallet{ID: id, PlayerID: playerID, Balance: money, Version: version}, nil
+}
+
+func (t *pgTx) GetWallet(ctx context.Context, id uuid.UUID) (domain.Wallet, error) {
+	row, err := t.q.GetWallet(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Wallet{}, usecase.ErrWalletNotFound
+	}
+	if err != nil {
+		return domain.Wallet{}, err
+	}
+	return toWallet(row.ID, row.PlayerID, row.Currency, row.Balance, row.Version)
+}
+
+func (t *pgTx) ListLedgerEntries(ctx context.Context, walletID uuid.UUID, afterVersion int64, limit int) ([]usecase.LedgerEntry, error) {
+	w, err := t.GetWallet(ctx, walletID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := t.q.ListLedgerEntries(ctx, sqlc.ListLedgerEntriesParams{WalletID: walletID, WalletVersion: afterVersion, Limit: int32(limit)})
+	if err != nil {
+		return nil, err
+	}
+	currency := w.Balance.Currency()
+	entries := make([]usecase.LedgerEntry, 0, len(rows))
+	for _, r := range rows {
+		var amounts [3]domain.Money
+		for i, cents := range []int64{r.Amount, r.BalanceBefore, r.BalanceAfter} {
+			if amounts[i], err = domain.MoneyFromCents(cents, currency); err != nil {
+				return nil, fmt.Errorf("ledger entry %s: %w", r.ID, err)
+			}
+		}
+		entries = append(entries, usecase.LedgerEntry{
+			ID: r.ID, WalletID: walletID, TransactionID: r.TransactionID, Direction: domain.Direction(r.Direction),
+			Amount: amounts[0], BalanceBefore: amounts[1], BalanceAfter: amounts[2], WalletVersion: r.WalletVersion, At: r.CreatedAt,
+		})
+	}
+	return entries, nil
+}
+
+func (t *pgTx) GetProviderTransaction(ctx context.Context, providerID string, id uuid.UUID) (usecase.Transaction, error) {
+	row, err := t.q.GetProviderTransaction(ctx, sqlc.GetProviderTransactionParams{ID: id, ProviderID: &providerID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return usecase.Transaction{}, usecase.ErrTransactionNotFound
+	}
+	if err != nil {
+		return usecase.Transaction{}, err
+	}
+	return toTransaction(row)
+}
+
+func (t *pgTx) GetProviderTransactionByExternalID(ctx context.Context, providerID, externalID string) (usecase.Transaction, error) {
+	row, err := t.q.GetProviderTransactionByExternalID(ctx, sqlc.GetProviderTransactionByExternalIDParams{
+		ProviderID: &providerID, ExternalTransactionID: &externalID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return usecase.Transaction{}, usecase.ErrTransactionNotFound
+	}
+	if err != nil {
+		return usecase.Transaction{}, err
+	}
+	// As duas consultas selecionam as mesmas colunas; as structs geradas são conversíveis.
+	return toTransaction(sqlc.GetProviderTransactionRow(row))
+}
+
+func toTransaction(r sqlc.GetProviderTransactionRow) (usecase.Transaction, error) {
+	money, err := domain.MoneyFromCents(r.Amount, domain.Currency(r.Currency))
+	if err != nil {
+		return usecase.Transaction{}, fmt.Errorf("transaction %s amount: %w", r.ID, err)
+	}
+	t := usecase.Transaction{
+		ID: r.ID, Kind: r.Kind, Status: domain.Status(r.Status), PlayerID: r.PlayerID, WalletID: r.WalletID,
+		Money: money, ReferenceTransactionID: r.ReferenceTransactionID, ReferenceAttempts: int(r.ReferenceAttempts),
+		NextAttemptAt: r.NextAttemptAt, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+	}
+	for dst, src := range map[*string]*string{
+		&t.ProviderID: r.ProviderID, &t.ExternalTransactionID: r.ExternalTransactionID, &t.RoundID: r.RoundID,
+		&t.GameID: r.GameID, &t.ReferenceExternalTransactionID: r.ReferenceExternalTransactionID, &t.FailureCode: r.FailureCode,
+	} {
+		if src != nil {
+			*dst = *src
+		}
+	}
+	if r.ResultBalance != nil {
+		balance, err := domain.MoneyFromCents(*r.ResultBalance, domain.Currency(r.Currency))
+		if err != nil {
+			return usecase.Transaction{}, fmt.Errorf("transaction %s result balance: %w", r.ID, err)
+		}
+		t.ResultBalance = &balance
+	}
+	return t, nil
+}
+
+func (t *pgTx) ReconciliationSnapshot(ctx context.Context, walletID uuid.UUID) (usecase.ReconciliationSnapshot, error) {
+	row, err := t.q.GetReconciliationSnapshot(ctx, walletID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return usecase.ReconciliationSnapshot{}, usecase.ErrWalletNotFound
+	}
+	if err != nil {
+		return usecase.ReconciliationSnapshot{}, err
+	}
+	currency := domain.Currency(row.Currency)
+	stored, err := domain.MoneyFromCents(row.Balance, currency)
+	if err != nil {
+		return usecase.ReconciliationSnapshot{}, fmt.Errorf("wallet %s reconciliation: %w", walletID, err)
+	}
+	// O saldo reconstruído pode ser negativo num ledger corrompido; é justamente o que a
+	// reconciliação deve reportar, não rejeitar.
+	ledger, err := domain.MoneyFromSignedCents(row.LedgerBalance, currency)
+	if err != nil {
+		return usecase.ReconciliationSnapshot{}, fmt.Errorf("wallet %s reconciliation: %w", walletID, err)
+	}
+	return usecase.ReconciliationSnapshot{StoredBalance: stored, LedgerBalance: ledger, Entries: row.Entries}, nil
 }
