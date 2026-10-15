@@ -567,8 +567,8 @@ func TestProcess_WalletProblemsArePersistedRejections(t *testing.T) {
 func TestProcess_SameKeyOnDifferentWalletsDebitsOnlyOnce(t *testing.T) {
 	db := newSchemaDB(t)
 	instances := db.instances(t, 3)
-	walletA := openFunded(t, instances[0], "100.00")
-	walletB := openFunded(t, instances[0], "100.00")
+	walletA := openFunded(t, instances[0], "150.00")
+	walletB := openFunded(t, instances[0], "150.00")
 	bets := []domain.Operation{
 		newBet(t, walletA, "tx-1", "provider-a:tx-1", "25.00"),
 		newBet(t, walletB, "tx-1", "provider-a:tx-1", "25.00"),
@@ -599,8 +599,9 @@ func TestProcess_SameKeyOnDifferentWalletsDebitsOnlyOnce(t *testing.T) {
 	}
 	a, _ := db.walletState(t, walletA.ID)
 	b, _ := db.walletState(t, walletB.ID)
-	if (10000-a)+(10000-b) != 5*2500 {
-		t.Fatalf("total debited = %d, want %d (one debit per round)", (10000-a)+(10000-b), 5*2500)
+	if (15000-a)+(15000-b) != 5*2500 {
+		t.Fatalf("total debited = %d, want %d (one debit per round)",
+			(15000-a)+(15000-b), 5*2500)
 	}
 }
 
