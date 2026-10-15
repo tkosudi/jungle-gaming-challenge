@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tkosudi/jungle-gaming-challenge/internal/postgres"
@@ -75,6 +77,23 @@ func walletCents(t *testing.T, pool *pgxpool.Pool, wallet string) int64 {
 		t.Fatal(err)
 	}
 	return cents
+}
+
+// lockWallet trava a carteira numa transação do próprio teste, como faria uma operação longa:
+// quem precisar dela espera no PostgreSQL. A função devolvida libera o lock.
+func lockWallet(t *testing.T, db *pgxpool.Pool, wallet string) func() {
+	t.Helper()
+	tx, err := db.BeginTx(context.Background(), pgx.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(context.Background(), `SELECT 1 FROM wallets WHERE id=$1 FOR UPDATE`, wallet); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { _ = tx.Commit(context.Background()) }) }
+	t.Cleanup(release)
+	return release
 }
 
 func TestSQS_RepeatedDeliveriesAndHTTPApplyOneEffect(t *testing.T) {

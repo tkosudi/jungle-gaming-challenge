@@ -38,7 +38,10 @@ jobs:
           fi
 
       - name: Go vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go vet -tags=integration ./...
+          go vet -tags=integration,distributed ./...
 
       - name: Unit tests
         run: go test -count=1 ./...
@@ -47,4 +50,106 @@ jobs:
         run: go test -race ./...
 
       - name: Build application
-        run: go build -o /tmp/jungle-api ./cmd/api
+        run: |
+          go build ./...
+          go build -o /tmp/jungle-api ./cmd/api
+
+  # PostgreSQL, Keycloak e LocalStack reais (Compose), com credenciais geradas na hora: nada de
+  # .env, token ou segredo versionado. O banco e as filas nascem vazios em cada execução.
+  integration:
+    name: Integration Tests and Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate ephemeral credentials
+        run: |
+          ./scripts/generate-env.sh
+          grep -E '^[A-Z_]*(PASSWORD|SECRET)[A-Z_]*=' .env | cut -d= -f2- | sed 's/^/::add-mask::/'
+
+      - name: Start the stack and wait for readiness
+        run: docker compose up -d --build --wait --wait-timeout 300
+
+      - name: Apply migrations (golang-migrate CLI v4.20.1)
+        run: docker compose run --rm migrate up
+
+      - name: Integration tests with race detector
+        run: go test -race -count=1 -tags=integration -timeout 20m ./...
+
+      - name: Smoke test (HTTP, OIDC, SQS, DLQ, outbox, reconciliation, metrics)
+        run: ./scripts/smoke-test.sh
+
+      - name: Revert and reapply migrations with the CLI
+        run: |
+          docker compose run --rm migrate down -all
+          docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT count(*) FROM pg_tables WHERE schemaname = '\''public'\'' AND tablename <> '\''schema_migrations'\''"' | grep -qx 0
+          docker compose run --rm migrate up
+          docker compose run --rm migrate version
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail=300
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  # Três processos reais do binário (go build -race), com SIGKILL e reinício completo.
+  distributed:
+    name: Distributed Test (three processes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate ephemeral credentials
+        run: |
+          ./scripts/generate-env.sh
+          grep -E '^[A-Z_]*(PASSWORD|SECRET)[A-Z_]*=' .env | cut -d= -f2- | sed 's/^/::add-mask::/'
+
+      - name: Start PostgreSQL, Keycloak and LocalStack and wait for readiness
+        run: docker compose up -d --wait --wait-timeout 300 postgres keycloak localstack
+
+      - name: Three-process test
+        env:
+          DISTRIBUTED_EVIDENCE_DIR: ${{ runner.temp }}/distributed
+        run: ./scripts/distributed-test.sh
+
+      - name: Upload evidence (PIDs, summary, JSON logs of each process)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: distributed-evidence
+          path: |
+            ${{ runner.temp }}/distributed/*.log
+            ${{ runner.temp }}/distributed/summary.txt
+          if-no-files-found: warn
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail=300
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v --remove-orphans

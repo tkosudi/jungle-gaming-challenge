@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -69,8 +71,16 @@ func (a *api) submitOperation(c fiber.Ctx) error {
 
 	ctx, cancel := requestContext(c)
 	defer cancel()
+	start := time.Now()
 	res, err := a.service.Process(ctx, p.ProviderID, op)
+	metrics.ProcessingDuration.WithLabelValues("http").Observe(time.Since(start).Seconds())
 	if err != nil {
+		switch {
+		case errors.Is(err, usecase.ErrLockTimeout):
+			metrics.Conflicts.WithLabelValues("http", "wallet_lock_timeout").Inc()
+		case errors.Is(err, usecase.ErrIdempotencyConflict):
+			metrics.Conflicts.WithLabelValues("http", "idempotency").Inc()
+		}
 		return serviceError(c, err)
 	}
 	if res.Replay {
@@ -78,6 +88,10 @@ func (a *api) submitOperation(c fiber.Ctx) error {
 	} else {
 		metrics.Operations.WithLabelValues("http", string(res.Status)).Inc()
 	}
+	// correlationId é o ID da transação financeira, o mesmo dos eventos publicados pela outbox.
+	slog.InfoContext(ctx, "wagering operation completed", "correlationId", res.TransactionID.String(),
+		"transactionId", res.TransactionID.String(), "walletId", op.WalletID.String(), "providerId", p.ProviderID,
+		"kind", string(op.Kind), "status", string(res.Status), "replay", res.Replay)
 	status := fiber.StatusOK
 	switch res.Status {
 	case domain.StatusPendingReference:

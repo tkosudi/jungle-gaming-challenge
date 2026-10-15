@@ -28,6 +28,23 @@ var (
 		Help: "Repeated deliveries recognized without new effects, by kind.",
 	}, []string{"kind"})
 
+	// ProcessingDuration mede o processamento de uma operação no caso de uso, por origem (http,
+	// sqs): validação, espera pelo lock da carteira, gravação e commit. Inclui as que falham.
+	ProcessingDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "wagering_processing_duration_seconds",
+		Help:    "Time spent processing a wagering operation (lock wait and commit included), by source.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"source"})
+
+	// Conflicts conta conflitos por origem e tipo: wallet_lock_timeout (a carteira ficou presa por
+	// outra transação além do lock_timeout; nada foi gravado e o reenvio é seguro), idempotency
+	// (chave ou ID externo já usados por outra operação) e message (messageId repetido com outro
+	// conteúdo, só no SQS).
+	Conflicts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "wagering_conflicts_total",
+		Help: "Wallet lock timeouts and idempotency or message conflicts, by source and kind.",
+	}, []string{"source", "kind"})
+
 	// SQSMessages conta o destino de cada mensagem recebida: completed, retried (falha
 	// transitória, volta à fila com atraso), dead_lettered (recusa permanente, enviada à DLQ)
 	// e released (recebida durante o shutdown e devolvida sem tratar).
@@ -76,7 +93,7 @@ var (
 )
 
 func init() {
-	Registry.MustRegister(Reconciliations, Operations, Duplicates, SQSMessages, DeadLettered,
+	Registry.MustRegister(Reconciliations, Operations, Duplicates, ProcessingDuration, Conflicts, SQSMessages, DeadLettered,
 		OutboxPublished, OutboxPublishFailures, OutboxOldestPendingAge, OutboxPending, ReferenceSteps, WorkerErrors)
 	// Séries que existem desde a partida (valor 0), para alertas antes do primeiro incremento.
 	Reconciliations.WithLabelValues("consistent")
@@ -84,4 +101,9 @@ func init() {
 	for _, outcome := range []string{"completed", "retried", "dead_lettered", "released"} {
 		SQSMessages.WithLabelValues(outcome)
 	}
+	for _, kind := range []string{"wallet_lock_timeout", "idempotency"} {
+		Conflicts.WithLabelValues("http", kind)
+		Conflicts.WithLabelValues("sqs", kind)
+	}
+	Conflicts.WithLabelValues("sqs", "message")
 }

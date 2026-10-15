@@ -13,7 +13,9 @@ Registro das decisões aprovadas, com o status real de implementação. O enunci
 | Outbox: persistência (M1.2) e publicador SQS FIFO (M3) | Implementado e testado com LocalStack |
 | API HTTP, autenticação OIDC (Keycloak), composição Fx do núcleo e reconciliação (M2, M2.1) | Implementado e testado com PostgreSQL e Keycloak reais |
 | Consumidor SQS FIFO com inbox transacional, DLQ e workers Fx (M3) | Implementado e testado com PostgreSQL, Keycloak e LocalStack reais |
-| Três processos independentes; separação de papéis do banco (D8); IAM real do broker | Pendente |
+| Três processos independentes do sistema operacional, SIGKILL e reinício completo (M4) | Testado com PostgreSQL, Keycloak e LocalStack reais |
+| CI com PostgreSQL, Keycloak e LocalStack reais; reprodução a partir de checkout limpo (M4) | Configurada; reprodução executada localmente |
+| Separação de papéis do banco (D8); IAM real do broker | Não implementado (ver limitações, M4) |
 
 ## Migrations: golang-migrate (e não Atlas)
 
@@ -233,7 +235,7 @@ Falhas de conexão do banco (recusa, perda antes do COMMIT, SQLSTATE `08*`, `57P
 - Ponta a ponta (`tests/`, Fx completo, PostgreSQL e Keycloak reais): fluxo de carteira e operações, replays, conflito, 422, 202 com consulta, isolamento entre provedores, `providerId` forjado no corpo ou em header, assinatura e payload adulterados, audience incorreta, token expirado, segredo errado recusado pelo Keycloak; 100/80/80 e 30 requisições idênticas distribuídas por 3 instâncias Fx com pools próprios.
 - Mutações verificadas: aceitar o `providerId` do corpo, pular a verificação de audience e a de issuer fazem testes falharem.
 - Smoke test na API do Compose: 401/403/201/200 (novo e replay)/404 entre provedores.
-- Limites: três processos reais continuam pendentes (as instâncias são do mesmo processo de teste); atualizar papéis no `realm.json` exige recriar o contêiner do Keycloak (`docker compose up -d --force-recreate keycloak`), que só importa realms inexistentes.
+- Limites: três processos reais continuam pendentes (as instâncias são do mesmo processo de teste) — executados no M4; atualizar papéis no `realm.json` exige recriar o contêiner do Keycloak (`docker compose up -d --force-recreate keycloak`), que só importa realms inexistentes.
 
 ## Reconciliação, Money com sinal e endurecimento do OIDC (M2.1)
 
@@ -362,8 +364,118 @@ Laço que chama `Service.ResolveNextPendingReference` (M1.3) até não haver pen
 - **Smoke test no Compose:** 3 reentregas e 1 mensagem inválida; 1 débito, fila vazia, DLQ com `INVALID_MESSAGE`, eventos publicados na ordem, métricas e logs JSON conferidos.
 
 ### Limites do M3
-- As "instâncias" dos testes são apps Fx com pools e clientes próprios no mesmo processo; três processos independentes continuam não executados.
+- As "instâncias" dos testes são apps Fx com pools e clientes próprios no mesmo processo; três processos independentes continuam não executados. Executados no M4.
 - IAM e políticas do broker não são aplicados pelo LocalStack Community; o vínculo produtor → provedor depende do papel de gateway descrito acima.
 - O consumidor trata uma mensagem por vez; a vazão vem de grupos distintos e de mais instâncias.
 - A DLQ não tem reprocessamento automático: é destino de inspeção, com o motivo no atributo `failureReason` (ou sem ele, quando veio pelo redrive).
 - O envio manual à DLQ (`SendMessage` na DLQ e depois `DeleteMessage` na entrada) **não é atômico**. Uma queda entre os dois, ou falha do `DeleteMessage`, faz a mensagem ser recusada de novo e copiada outra vez. O `MessageDeduplicationId` da cópia é o ID SQS original, então o SQS FIFO descarta a repetição em 5 minutos; depois disso a DLQ pode ter duplicatas. Limitação aceita: a DLQ não aplica efeitos financeiros.
+
+## Validação distribuída, CI e entrega (M4)
+
+### Três processos reais (`tests/distributed_test.go`, `scripts/distributed-test.sh`)
+- **Montagem:**
+  - o teste compila `cmd/api` com `-race` e executa o binário como processos do sistema operacional (PIDs distintos entre si e do processo de teste), cada um com memória, pool PostgreSQL e cliente SQS próprios;
+  - todos compartilham um banco descartável (migrations aplicadas), o Keycloak (tokens reais) e filas FIFO exclusivas da execução no LocalStack;
+  - os processos recebem a configuração por variáveis de ambiente, como no Compose.
+- **Pontos de falha controlados:** cada processo fala com o SQS por um proxy próprio, que é código de teste e repassa o protocolo JSON do SQS ao LocalStack. O proxy registra o que cada processo recebeu e enviou e tem duas armadilhas de disparo único. Quando uma dispara, o teste mata o processo com `SIGKILL` e confere que foi o sinal que o encerrou:
+  1. **commit sem ACK:** o `DeleteMessage` de uma mensagem já confirmada no banco fica retido e nunca chega ao SQS;
+  2. **envio sem confirmação:** o `SendMessage` de um evento chega ao SQS e é aceito, mas a resposta não volta ao processo.
+- **Determinismo:**
+  - a simultaneidade entre processos é provada, não presumida: o teste trava a carteira numa transação própria e espera N sessões bloqueadas em lock (`pg_stat_activity.wait_event_type = 'Lock'`) antes de liberar;
+  - não há sleep como sincronização: as esperas consultam condições observáveis (banco, fila, métricas) com prazo;
+  - IDs externos têm prefixo único por execução.
+- **Evidências:** PIDs, distribuição do trabalho, logs JSON de cada processo e métricas finais ficam em `summary.txt` e `process-N.log` dentro de `DISTRIBUTED_EVIDENCE_DIR`. Na CI, viram artefato do job `distributed`.
+
+Execuções em 2026-10-14, seis no total:
+
+- duas falharam por espera curta demais depois de `SIGKILL`; ver "Observado e aceito" abaixo;
+- depois da correção, duas execuções seguidas passaram (208s e 148s); na primeira, o atraso de 60s aconteceu duas vezes e foi absorvido;
+- antes dela, uma execução local e a reprodução a partir de cópia limpa já tinham passado (148s cada).
+
+Números de uma execução; a distribuição do trabalho entre processos varia:
+
+| Cenário | Resultado observado |
+| --- | --- |
+| 100,00 e duas BETs de 80,00 enviadas aos processos 2 e 3, ambos esperando o mesmo lock | 1 `PROCESSED`, 1 `REJECTED`; saldo 20,00; 1 débito |
+| 50 requisições equivalentes (17/17/16 por processo), todas esperando o lock | 1 original e 49 replays com o mesmo `transactionId`; 1 débito |
+| HTTP e depois a mesma operação 2× pelo SQS (2 processos receberam); SQS e depois HTTP após nova BET | 1 efeito por operação; a inbox aponta a transação do HTTP; o replay devolve o saldo original (70,00, com o atual em 65,00) |
+| Uma carteira travada e 9 operações em outras carteiras (3 por processo) | As 9 terminaram em 25–31 ms com o lock mantido; a travada só rodou depois da liberação |
+| Disputa por 30 mensagens SQS, eventos da outbox e 30 ROLLBACKs pendentes | Consumo 11/10/9, publicação 83/100/107, resoluções 15/5/10; as 30 pendências foram resolvidas uma vez cada |
+| SIGKILL do processo que segurava o `DeleteMessage` (commit feito, 70 ms depois), com 2 requisições HTTP dele esperando um lock e 15 mensagens em andamento | Inbox com a linha e mensagem ainda na fila no instante do kill; reentrega a outro processo após o visibility timeout, reconhecida como duplicata; as 2 requisições cortadas foram reenviadas a outro processo com a mesma chave; 6 débitos na carteira disputada, 1 em cada outra |
+| SIGKILL do publicador depois de o SQS aceitar o evento | Evento ainda não publicado no banco; outro processo o republicou com o mesmo `eventId`; a fila de eventos tem 1 cópia |
+| SIGKILL dos três processos e 3 processos novos (PIDs novos) | Pendências HTTP e SQS preservadas; replays HTTP nos 3 processos novos devolvem o resultado original; reenvio do mesmo `messageId` é duplicata; as referências chegam e as pendências são resolvidas pelos processos novos |
+| Conferência final | 62 carteiras reconciliadas por HTTP, todas consistentes; saldo = créditos − débitos; versão = última versão do ledger, sem lacunas; nenhuma transação com 2 lançamentos; nenhuma operação externa duplicada; nenhum saldo negativo; 421 eventos da outbox todos entregues, nenhum `eventId` repetido; DLQ vazia; sem relato do race detector; SIGTERM final com código 0 nos 3 processos |
+
+- **Observado e aceito:** depois de um `SIGKILL`, o long polling do processo morto continua aberto no broker por até 5s e pode "receber" uma mensagem. Ela fica invisível até o visibility timeout (60s) e então volta.
+  - Verificado à parte no LocalStack 4.6.0: abandonar um `ReceiveMessage` com espera e enviar uma mensagem deixa-a em voo (`NotVisible=1`), sem chegar a outro consumidor.
+  - No reinício completo, a mensagem reenviada logo depois dos `SIGKILL` foi reconhecida por um processo novo só cerca de 60s depois.
+  - Uma execução falhou por isso: um REFUND enviado 140 ms depois do `SIGKILL` do publicador ficou 60s invisível, e o teste esperava só 20s. Nada foi perdido nem aplicado duas vezes.
+  - Correção, só no teste: toda espera por consumo SQS logo depois de um `SIGKILL` usa a janela `afterKillRedelivery` (60s de visibility + 5s de long polling + margem = 90s), e o tempo observado fica registrado.
+  - É atraso, não perda; o limite é o visibility timeout.
+- **Não coberto:** partição de rede entre processos e banco, queda do próprio PostgreSQL ou do LocalStack durante o teste e falha de disco. Não há aceite assíncrono: o HTTP responde depois do commit, e o único estado pendente é `PENDING_REFERENCE`, coberto acima.
+
+### Critérios eliminatórios (§14) e evidência
+| Critério | Evidência |
+| --- | --- |
+| Autenticação efetiva nos endpoints de negócio | Tokens do Keycloak real em todos os testes ponta a ponta; 401 sem token, com token inválido, expirado ou de outra audience; smoke test (M2, M4) |
+| Sem acesso não autorizado a operações ou transações | Provedor só vê as próprias transações, inclusive em replay; `providerId` vem do token; rotas de carteira exigem `wallet-operator` (M2) |
+| Sem ponto flutuante em dinheiro | `Money` em `int64`; o contrato JSON usa strings; número JSON é recusado no decode (M1.2, M2) |
+| Sem saldo negativo por concorrência | `CHECK (balance >= 0)`, lock por carteira; 100/80/80 com três processos reais (M1.1, M4) |
+| Sem movimentação duplicada | Idempotência persistente + inbox + `UNIQUE`; 50 requisições em 3 processos, HTTP×SQS, SIGKILL antes do ACK (M4) |
+| Idempotência não restrita à memória | Reinício completo dos processos preserva replays e pendências (M4) |
+| Não depender de uma única instância | Três processos disputando HTTP, SQS, outbox e referências; uma instância morta é substituída sem perda (M4) |
+| Sem publicação antes do commit | Outbox na mesma transação; publicado só depois da resposta do SQS; envio sem confirmação é republicado (M3, M4) |
+| Ledger auditável | Append-only com triggers, encadeamento por versão, reconciliação por HTTP (M1.1, M2.1, M4) |
+| Sem substituir PostgreSQL, SQS e IdP por mocks | Integração, smoke test e teste distribuído usam os três reais; mocks só nos unitários de transporte e domínio |
+
+### CI (`.github/workflows/ci.yml`)
+- **`quality`:** `gofmt`; `go vet` com cada conjunto de tags; testes unitários com e sem `-race`; build.
+- **`integration`:**
+  - `scripts/generate-env.sh` gera um `.env` efêmero com segredos aleatórios, mascarados no log;
+  - `docker compose up --build --wait` usa os healthchecks: `/health/ready` do Keycloak e da API e as filas do LocalStack;
+  - migrations aplicadas pela CLI (`docker compose run --rm migrate up`);
+  - `go test -race -tags=integration ./...` e o smoke test;
+  - `down -all`, com conferência de 0 tabelas, e `up` de novo;
+  - em falha, `docker compose ps` e os logs.
+- **`distributed`:** mesma preparação, o teste com três processos e o upload das evidências.
+- Cada job parte de volumes vazios e os remove no fim. Nada de `.env`, token ou segredo versionado.
+
+### Reprodução a partir de checkout limpo
+Executada (2026-10-14) numa cópia só com os arquivos versionados e os novos, sem `.env`, com portas alternativas e a mesma sequência da CI. Ver o README para os comandos e quais dependências cada um exige. Resultados, todos com sucesso:
+
+1. `scripts/generate-env.sh`;
+2. `docker compose up -d --build --wait`: os 4 serviços `healthy` em 65s;
+3. `docker compose run --rm migrate up`: versão 4;
+4. `go test -race -tags=integration ./...`: `postgres` em 46s, `tests` em 169s;
+5. `scripts/smoke-test.sh`: 15 verificações;
+6. `migrate down -all`: 0 tabelas da aplicação; `migrate up` de novo: versão 4;
+7. `scripts/distributed-test.sh`: 148s;
+8. `docker compose down -v`.
+
+### Observabilidade: lacunas corrigidas no M4
+- `wagering_processing_duration_seconds{source}` (histograma): latência do caso de uso, incluindo a espera pelo lock e o commit.
+- `wagering_conflicts_total{source,kind}`: `wallet_lock_timeout`, `idempotency` e `message`. As séries existem desde a partida.
+- Log `wagering operation completed` no HTTP e `correlationId` nos logs do HTTP e do SQS. O `correlationId` é o ID da transação financeira, o mesmo `correlationId` dos eventos da outbox, o que permite cruzar logs e eventos. O enunciado não define um cabeçalho de correlação de entrada; não foi criado um.
+- `TestObservability_OperationLogsAndMetrics` (RED antes, GREEN depois) verifica:
+  - as séries e os incrementos;
+  - os identificadores nos logs JSON;
+  - a ausência do token, do client secret e dos campos monetários nos logs.
+
+### Limitações aceitas e controles não implementados
+- **Produtor SQS no LocalStack:** o Community não aplica IAM nem políticas. A fronteira local é a lista `SQS_TRUSTED_PROVIDERS` mais a rede do Compose. Em produção, a política da fila precisa restringir `SendMessage` ao gateway (seção M3).
+- **At-least-once:**
+  - entrada SQS: a deduplicação vem da inbox e da idempotência persistente;
+  - eventos da outbox: republicação com o mesmo `eventId`; o SQS FIFO deduplica por 5 minutos, e depois disso os consumidores precisam deduplicar por `eventId`.
+  - Não há exactly-once.
+- **DLQ:** o envio manual não é atômico com o `DeleteMessage` e pode deixar duplicatas na DLQ depois da janela de 5 minutos. Não há reprocessamento automático.
+- **Depois de SIGKILL:** uma mensagem pode atrasar até o visibility timeout (ver acima).
+- **Não implementado para produção:**
+  - papéis separados no PostgreSQL (D8);
+  - IAM real e uma fila por provedor ou mensagens assinadas;
+  - TLS entre serviços;
+  - Keycloak em `start-dev` (HTTP, banco embutido);
+  - secret manager (os segredos ficam no `.env` local);
+  - rate limiting;
+  - alta disponibilidade e backup do PostgreSQL;
+  - alertas.
+- **Opcionais do enunciado, não feitos:** tracing, dashboards, teste de carga e partidas dobradas.

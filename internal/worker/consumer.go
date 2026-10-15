@@ -137,21 +137,28 @@ func (c *Consumer) handle(ctx context.Context, m types.Message) {
 		return
 	}
 
+	start := time.Now()
 	res, err := c.service.ProcessMessage(ctx, usecase.InboxMessage{
 		ConsumerName: c.cfg.ConsumerName, MessageID: req.MessageID, PayloadHash: req.ContentHash,
 		ReceivedAt: firstReceive(m),
 	}, req.ProviderID, req.Operation)
+	metrics.ProcessingDuration.WithLabelValues("sqs").Observe(time.Since(start).Seconds())
 	switch {
 	case errors.Is(err, usecase.ErrMessageConflict):
+		metrics.Conflicts.WithLabelValues("sqs", "message").Inc()
 		c.deadLetter(ctx, m, reasonMessageConflict, err)
 		return
 	case errors.Is(err, usecase.ErrIdempotencyConflict):
+		metrics.Conflicts.WithLabelValues("sqs", "idempotency").Inc()
 		c.deadLetter(ctx, m, reasonIdempotencyConflict, err)
 		return
 	case errors.Is(err, domain.ErrInvalidOperation), errors.Is(err, usecase.ErrInvalidProvider):
 		c.deadLetter(ctx, m, reasonInvalidMessage, err)
 		return
 	case err != nil:
+		if errors.Is(err, usecase.ErrLockTimeout) {
+			metrics.Conflicts.WithLabelValues("sqs", "wallet_lock_timeout").Inc()
+		}
 		c.retry(m, log, err)
 		return
 	}
@@ -164,8 +171,9 @@ func (c *Consumer) handle(ctx context.Context, m types.Message) {
 	default:
 		metrics.Operations.WithLabelValues("sqs", string(res.Status)).Inc()
 	}
-	log.Info("sqs message completed", "transactionId", res.TransactionID.String(), "status", string(res.Status),
-		"duplicate", res.Duplicate, "replay", res.Replay)
+	// correlationId é o ID da transação financeira, o mesmo dos eventos publicados pela outbox.
+	log.Info("sqs message completed", "correlationId", res.TransactionID.String(), "transactionId", res.TransactionID.String(),
+		"status", string(res.Status), "duplicate", res.Duplicate, "replay", res.Replay)
 	c.delete(m, log)
 	metrics.SQSMessages.WithLabelValues("completed").Inc()
 }
