@@ -32,10 +32,24 @@ services:
       INTERNAL_SERVICE_CLIENT_SECRET: ${INTERNAL_SERVICE_CLIENT_SECRET:?set it in .env}
       TEST_OTHER_AUDIENCE_CLIENT_SECRET: ${TEST_OTHER_AUDIENCE_CLIENT_SECRET:?set it in .env}
       TEST_SHORT_LIVED_CLIENT_SECRET: ${TEST_SHORT_LIVED_CLIENT_SECRET:?set it in .env}
+      # Expõe /health/ready na porta de gerenciamento (9000, só dentro da rede do Compose).
+      KC_HEALTH_ENABLED: "true"
     ports:
       - "127.0.0.1:${KEYCLOAK_PORT:-8180}:8080"
     volumes:
       - ./infra/keycloak/realm.json:/opt/keycloak/data/import/jungle-realm.json:ro
+    # Saudável depois do boot, que inclui a importação do realm. A imagem não tem curl/wget:
+    # a requisição sai pelo /dev/tcp do bash.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf "GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 &&
+          grep -q "\"status\": \"UP\"" <&3
+      interval: 5s
+      timeout: 5s
+      retries: 60
 
   localstack:
     image: localstack/localstack:4.6.0
@@ -80,8 +94,31 @@ services:
         condition: service_started
       localstack:
         condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1:8080/health/ready
+      interval: 5s
+      timeout: 3s
+      retries: 12
     # Acima do fx.StopTimeout (120s, ver internal/app): o processo termina o shutdown antes do SIGKILL.
     stop_grace_period: 130s
+
+  # Ferramenta (não sobe com "docker compose up"): golang-migrate na rede do Compose.
+  #   docker compose run --rm migrate up | down -all | version
+  migrate:
+    image: migrate/migrate:v4.20.1
+    profiles:
+      - tools
+    entrypoint:
+      - migrate
+      - -path=/migrations
+      - -database=postgres://${POSTGRES_USER:-jungle}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-jungle}?sslmode=disable
+    volumes:
+      - ./db/migrations:/migrations:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:
