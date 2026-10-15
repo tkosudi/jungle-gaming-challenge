@@ -451,3 +451,25 @@ func (t *pgTx) ReconciliationSnapshot(ctx context.Context, walletID uuid.UUID) (
 	}
 	return usecase.ReconciliationSnapshot{StoredBalance: stored, LedgerBalance: ledger, Entries: row.Entries}, nil
 }
+
+func (t *pgTx) FindInboxMessage(ctx context.Context, consumerName, messageID string) (usecase.StoredInboxMessage, bool, error) {
+	row, err := t.q.FindInboxMessage(ctx, sqlc.FindInboxMessageParams{ConsumerName: consumerName, MessageID: messageID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return usecase.StoredInboxMessage{}, false, nil
+	}
+	if err != nil {
+		return usecase.StoredInboxMessage{}, false, err
+	}
+	return usecase.StoredInboxMessage{PayloadHash: row.PayloadHash, TransactionID: row.TransactionID, Outcome: domain.Status(row.Outcome)}, true, nil
+}
+
+func (t *pgTx) InsertInboxMessage(ctx context.Context, r usecase.InboxRecord) (bool, error) {
+	_, err := t.q.InsertInboxMessage(ctx, sqlc.InsertInboxMessageParams{
+		ConsumerName: r.ConsumerName, MessageID: r.MessageID, PayloadHash: r.PayloadHash[:], TransactionID: r.TransactionID,
+		Outcome: string(r.Outcome), ReceivedAt: r.ReceivedAt, CompletedAt: r.CompletedAt,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}

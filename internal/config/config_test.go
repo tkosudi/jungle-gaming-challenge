@@ -2,15 +2,18 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 )
 
 // baseEnv é o mínimo válido; cada teste sobrescreve o que examina.
 func baseEnv(overrides map[string]string) map[string]string {
 	env := map[string]string{
-		"DATABASE_URL":    "postgres://localhost/db",
-		"OIDC_ISSUER_URL": "http://localhost:8180/realms/jungle",
-		"OIDC_AUDIENCE":   "wagering-api",
+		"DATABASE_URL":          "postgres://localhost/db",
+		"OIDC_ISSUER_URL":       "http://localhost:8180/realms/jungle",
+		"OIDC_AUDIENCE":         "wagering-api",
+		"SQS_TRUSTED_PROVIDERS": "provider-a,provider-b",
 	}
 	for k, v := range overrides {
 		env[k] = v
@@ -136,6 +139,59 @@ func TestLoad_InvalidOIDC(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := Load(getenvFrom(baseEnv(tt.env))); !errors.Is(err, tt.want) {
 				t.Fatalf("Load() error = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoad_SQSAndWorkerDefaults(t *testing.T) {
+	cfg, err := Load(getenvFrom(baseEnv(nil)))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	s := cfg.SQS
+	if s.Region != "us-east-1" || s.EndpointURL != "" || s.RequestsQueue != "wager-transactions.fifo" ||
+		s.DeadLetterQueue != "wager-transactions-dlq.fifo" || s.EventsQueue != "wager-events.fifo" ||
+		s.ConsumerName != "wager-transactions-consumer" || s.RetryBaseDelay != time.Second || s.RetryMaxDelay != time.Minute {
+		t.Errorf("SQS = %+v", s)
+	}
+	if fmt.Sprint(s.TrustedProviders) != "[provider-a provider-b]" {
+		t.Errorf("TrustedProviders = %v", s.TrustedProviders)
+	}
+	w := cfg.Workers
+	if w.ReferenceInitialBackoff != time.Second || w.ReferenceMaxBackoff != time.Minute || w.ReferenceMaxAttempts != 10 ||
+		w.ReferencePollInterval != time.Second || w.OutboxPollInterval != 500*time.Millisecond {
+		t.Errorf("Workers = %+v", w)
+	}
+
+	cfg, err = Load(getenvFrom(baseEnv(map[string]string{
+		"AWS_ENDPOINT_URL": "http://localstack:4566", "SQS_TRUSTED_PROVIDERS": " provider-a , provider-c ",
+		"SQS_RETRY_BASE_DELAY": "200ms", "REFERENCE_MAX_ATTEMPTS": "3", "OUTBOX_POLL_INTERVAL": "50ms",
+	})))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.SQS.EndpointURL != "http://localstack:4566" || fmt.Sprint(cfg.SQS.TrustedProviders) != "[provider-a provider-c]" ||
+		cfg.SQS.RetryBaseDelay != 200*time.Millisecond || cfg.Workers.ReferenceMaxAttempts != 3 || cfg.Workers.OutboxPollInterval != 50*time.Millisecond {
+		t.Errorf("config = %+v", cfg)
+	}
+}
+
+func TestLoad_InvalidSQSAndWorkers(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"no trusted providers":       {"SQS_TRUSTED_PROVIDERS": " , "},
+		"requests queue is not FIFO": {"SQS_REQUESTS_QUEUE": "wager-transactions"},
+		"events queue is not FIFO":   {"SQS_EVENTS_QUEUE": "events"},
+		"invalid duration":           {"SQS_RETRY_BASE_DELAY": "soon"},
+		"negative duration":          {"OUTBOX_POLL_INTERVAL": "-1s"},
+		"max below base":             {"SQS_RETRY_BASE_DELAY": "2m", "SQS_RETRY_MAX_DELAY": "1m"},
+		"zero attempts":              {"REFERENCE_MAX_ATTEMPTS": "0"},
+		"attempts not a number":      {"REFERENCE_MAX_ATTEMPTS": "many"},
+		"invalid endpoint":           {"AWS_ENDPOINT_URL": "localstack:4566"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(getenvFrom(baseEnv(env))); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("Load() error = %v, want ErrInvalidConfig", err)
 			}
 		})
 	}

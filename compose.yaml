@@ -47,6 +47,14 @@ services:
       - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
     volumes:
       - ./infra/localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+    # Saudável só depois que o script de init criou as filas (a última é a de eventos).
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - awslocal sqs get-queue-url --queue-name wager-events.fifo >/dev/null
+      interval: 5s
+      timeout: 5s
+      retries: 30
 
   api:
     build:
@@ -60,8 +68,9 @@ services:
       OIDC_AUDIENCE: "wagering-api"
       AWS_ENDPOINT_URL: "http://localstack:4566"
       AWS_REGION: ${AWS_REGION:-us-east-1}
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?set AWS_ACCESS_KEY_ID in .env}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?set AWS_SECRET_ACCESS_KEY in .env}
+      SQS_TRUSTED_PROVIDERS: ${SQS_TRUSTED_PROVIDERS:?set SQS_TRUSTED_PROVIDERS in .env}
     ports:
       - "127.0.0.1:${APP_PORT:-8080}:8080"
     depends_on:
@@ -70,8 +79,9 @@ services:
       keycloak:
         condition: service_started
       localstack:
-        condition: service_started
-    stop_grace_period: 30s
+        condition: service_healthy
+    # Acima do fx.StopTimeout (120s, ver internal/app): o processo termina o shutdown antes do SIGKILL.
+    stop_grace_period: 130s
 
 volumes:
   postgres_data:

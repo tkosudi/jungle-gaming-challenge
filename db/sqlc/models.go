@@ -10,6 +10,16 @@ import (
 	"github.com/google/uuid"
 )
 
+type InboxMessage struct {
+	ConsumerName  string
+	MessageID     string
+	PayloadHash   []byte
+	TransactionID uuid.UUID
+	Outcome       string
+	ReceivedAt    time.Time
+	CompletedAt   time.Time
+}
+
 type OutboxEvent struct {
 	EventID        uuid.UUID
 	EventType      string

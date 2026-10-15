@@ -19,27 +19,32 @@ import (
 )
 
 const (
-	maxBodyBytes     = 64 << 10
-	requestTimeout   = 10 * time.Second
-	readinessTimeout = 2 * time.Second
+	maxBodyBytes   = 64 << 10
+	requestTimeout = 10 * time.Second
+	// MaxShutdownDuration: o shutdown do Fiber espera as requisições em andamento, limitadas a
+	// requestTimeout.
+	MaxShutdownDuration = requestTimeout
+	readinessTimeout    = 2 * time.Second
 )
 
-// Pinger verifica a disponibilidade do PostgreSQL para o readiness (*pgxpool.Pool o satisfaz).
-type Pinger interface {
-	Ping(ctx context.Context) error
+// ReadinessCheck verifica uma dependência necessária para atender (PostgreSQL, SQS). O IdP
+// não entra: indisponibilidade do Keycloak afeta só a autenticação (503 nas rotas protegidas).
+type ReadinessCheck struct {
+	Name  string
+	Check func(ctx context.Context) error
 }
 
 type api struct {
 	service  *usecase.Service
 	verifier *auth.Verifier
-	db       Pinger
+	checks   []ReadinessCheck
 }
 
 // NewApp cria a aplicação Fiber com todas as rotas. Health checks são públicos; operações de
 // carteira exigem o papel interno; operações de apostas exigem a identidade de um provedor.
-func NewApp(service *usecase.Service, verifier *auth.Verifier, db Pinger) *fiber.App {
+func NewApp(service *usecase.Service, verifier *auth.Verifier, checks []ReadinessCheck) *fiber.App {
 	app := fiber.New(fiber.Config{BodyLimit: maxBodyBytes, ErrorHandler: handleError})
-	a := &api{service: service, verifier: verifier, db: db}
+	a := &api{service: service, verifier: verifier, checks: checks}
 
 	app.Get("/health/live", live)
 	app.Get("/health/ready", a.ready)
@@ -63,17 +68,22 @@ func live(c fiber.Ctx) error {
 	return c.JSON(fiber.Map{"status": "ok"})
 }
 
-// ready responde 503 enquanto o PostgreSQL não responde. O SQS entra na verificação quando
-// o consumidor existir (M3).
+// ready responde 503 enquanto alguma dependência (PostgreSQL, SQS) não responde. Liveness
+// (/health/live) não depende de nada externo.
 func (a *api) ready(c fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), readinessTimeout)
 	defer cancel()
-	if err := a.db.Ping(ctx); err != nil {
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"status": "unavailable", "checks": fiber.Map{"postgres": "unavailable"},
-		})
+	status, results := "ok", fiber.Map{}
+	for _, check := range a.checks {
+		results[check.Name] = "ok"
+		if err := check.Check(ctx); err != nil {
+			status, results[check.Name] = "unavailable", "unavailable"
+		}
 	}
-	return c.JSON(fiber.Map{"status": "ok", "checks": fiber.Map{"postgres": "ok"}})
+	if status != "ok" {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"status": status, "checks": results})
+	}
+	return c.JSON(fiber.Map{"status": status, "checks": results})
 }
 
 // requestContext limita o tempo de cada requisição: o contexto do Fiber não é cancelado

@@ -12,6 +12,64 @@ import (
 	"github.com/google/uuid"
 )
 
+const claimOutboxHeads = `-- name: ClaimOutboxHeads :many
+SELECT e.event_id, e.event_type, e.message_group_id, e.payload, e.sequence, e.attempts, e.created_at
+FROM outbox_events e
+WHERE e.published_at IS NULL
+  AND e.next_attempt_at <= now()
+  AND NOT EXISTS (
+      SELECT 1 FROM outbox_events p
+       WHERE p.message_group_id = e.message_group_id
+         AND p.published_at IS NULL
+         AND p.sequence < e.sequence)
+ORDER BY e.sequence
+LIMIT $1
+FOR UPDATE OF e SKIP LOCKED
+`
+
+type ClaimOutboxHeadsRow struct {
+	EventID        uuid.UUID
+	EventType      string
+	MessageGroupID string
+	Payload        []byte
+	Sequence       *int64
+	Attempts       int32
+	CreatedAt      time.Time
+}
+
+// Só a cabeça de cada grupo (carteira): um evento é elegível se nenhum anterior do mesmo grupo
+// está pendente, vencido ou não. SKIP LOCKED sozinho deixaria um segundo publicador pegar o
+// evento seguinte enquanto o anterior ainda está em envio; o NOT EXISTS impede essa
+// ultrapassagem, e o lock de linha impede dois publicadores no mesmo evento. Grupos
+// diferentes avançam em paralelo; não há lock global.
+func (q *Queries) ClaimOutboxHeads(ctx context.Context, limit int32) ([]ClaimOutboxHeadsRow, error) {
+	rows, err := q.db.Query(ctx, claimOutboxHeads, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ClaimOutboxHeadsRow
+	for rows.Next() {
+		var i ClaimOutboxHeadsRow
+		if err := rows.Scan(
+			&i.EventID,
+			&i.EventType,
+			&i.MessageGroupID,
+			&i.Payload,
+			&i.Sequence,
+			&i.Attempts,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertOutboxEvent = `-- name: InsertOutboxEvent :exec
 INSERT INTO outbox_events (
     event_id, event_type, schema_version, aggregate_id, message_group_id,
@@ -41,5 +99,50 @@ func (q *Queries) InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventPa
 		arg.Payload,
 		arg.OccurredAt,
 	)
+	return err
+}
+
+const markOutboxPublished = `-- name: MarkOutboxPublished :exec
+UPDATE outbox_events SET published_at = now(), attempts = attempts + 1 WHERE event_id = $1
+`
+
+func (q *Queries) MarkOutboxPublished(ctx context.Context, eventID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markOutboxPublished, eventID)
+	return err
+}
+
+const outboxBacklog = `-- name: OutboxBacklog :one
+SELECT COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0)::float8 AS oldest_age_seconds,
+       count(*) AS pending
+FROM outbox_events
+WHERE published_at IS NULL
+`
+
+type OutboxBacklogRow struct {
+	OldestAgeSeconds float64
+	Pending          int64
+}
+
+// Para a métrica de atraso: idade do evento pendente mais antigo e quantidade pendente.
+func (q *Queries) OutboxBacklog(ctx context.Context) (OutboxBacklogRow, error) {
+	row := q.db.QueryRow(ctx, outboxBacklog)
+	var i OutboxBacklogRow
+	err := row.Scan(&i.OldestAgeSeconds, &i.Pending)
+	return i, err
+}
+
+const scheduleOutboxRetry = `-- name: ScheduleOutboxRetry :exec
+UPDATE outbox_events
+SET attempts = attempts + 1, next_attempt_at = now() + ($2::bigint * interval '1 millisecond')
+WHERE event_id = $1
+`
+
+type ScheduleOutboxRetryParams struct {
+	EventID uuid.UUID
+	Column2 int64
+}
+
+func (q *Queries) ScheduleOutboxRetry(ctx context.Context, arg ScheduleOutboxRetryParams) error {
+	_, err := q.db.Exec(ctx, scheduleOutboxRetry, arg.EventID, arg.Column2)
 	return err
 }
